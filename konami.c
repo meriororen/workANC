@@ -55,6 +55,7 @@ typedef enum {
 	MODE_NONE,
 	MODE_PLAY,
 	MODE_PLAY_FIX,
+	MODE_PLAY_IMPULSE,
 	MODE_RECORD,
 	MODE_REALTIME,
 } audio_mode_t;
@@ -89,8 +90,8 @@ static void sigint_handler(int sig)
 
 static inline void next_addr(struct runtime *run, unsigned long addr)
 {
-	run->current += run->count * BUFSIZE;
-	if (run->count > BUFCOUNT) { 
+	run->current = addr + run->count * BUFSIZE;
+	if (run->count == BUFCOUNT) { 
 		run->count = 0; 
 		run->current = addr;
 	}
@@ -107,14 +108,13 @@ static int play_next_period(struct runtime *run, int fix)
 	desc.read_address = run->current;
 	desc.length = BUFSIZE;
 	desc.control = DESC_CTL_GO | DESC_CTL_CMPL_IRQ;
-	//if (fix) desc.control |= (1 << 10);
 
 	ret = ioctl(run->fd, KONAMI_PREPARE, &desc);
 	if (ret) {
 		printf("PLAY: failed ioctl: %d, fd: %d\n", ret * errno, run->fd);
 	}
 
-	printf("Start Playing.. %08x\n", run->current);
+//	printf("Start Playing.. %08x count %d\n", run->current, run->count);
 	ret = ioctl(run->fd, KONAMI_START_PLAY);
 	if (ret) {
 		printf("Failed ioctl: %d\n", ret * errno);
@@ -140,7 +140,7 @@ static int record_next_period(struct runtime *run)
 		printf("REC: failed ioctl: %d\n", ret * errno);
 	}
 
-	printf("Start Recording.. %08x count: %d\n", run->current, run->count);
+	//printf("Start Recording.. %08x count: %d\n", run->current, run->count);
 	ret = ioctl(run->fd, KONAMI_START_RECORD);
 	if (ret) {
 		printf("Failed ioctl: %d\n", ret * errno);
@@ -187,7 +187,7 @@ static int init_devices(struct runtime *rx, struct runtime *tx)
 	}
 }
 
-static void initialize(struct runtime *rxrun, struct runtime *txrun,
+static void init_mode(struct runtime *rxrun, struct runtime *txrun,
 								audio_mode_t mode) 
 {
 	switch (mode) {
@@ -207,21 +207,22 @@ static void initialize(struct runtime *rxrun, struct runtime *txrun,
 	txrun->count = 0;	
 }
 
-static unsigned long write_period(struct runtime *run, FILE *file)
+static int write_period(struct runtime *run, FILE *file)
 {
-	int i;
+	int in, i, c;
 	char buf[3];
-	unsigned long total = 0;
+	int total = 0;
+	in = i = run->count * BUFSIZE/4;
 
-	for(i = 0; i < BUFSIZE/4; i++) {
+	while (i < in + BUFSIZE/4) {
 		buf[0] = run->buf[i] & 0xff;
 		buf[1] = (run->buf[i] >> 8) & 0xff;
 		buf[2] = (run->buf[i] >> 16) & 0xff;
-		total += fwrite(buf, 3, 1, file);
+		total += fwrite(buf, sizeof(buf), 1, file);
+		i++;
 	}
-	//printf("%d\n", total);
 	
-	return total * 3;
+	return total * (sizeof(buf));
 }
 
 static size_t init_wav(FILE *file)
@@ -235,6 +236,7 @@ static size_t init_wav(FILE *file)
 		0x10, 0x00, 0x00, 0x00, /* size of fmt chunk (16) */
 		0x01, 0x00, 0x02, 0x00, /* PCM; 2-channels */
 		0x80, 0xBB, 0x00, 0x00, /* 48000 Hz */	
+		0x00, 0x65, 0x04, 0x00, /* Byte Rate */
 		0x06, 0x00, 0x18, 0x00, /* 6 Bytes Align, 24 bits per sample */
 		0x64, 0x61, 0x74, 0x61, /* "data" */
 		0x00, 0x00, 0x00, 0x00, /* Data chunk size (Size - 0x24) */
@@ -243,15 +245,140 @@ static size_t init_wav(FILE *file)
 	return fwrite(sample_header, 1, sizeof(sample_header), file);
 }
 
+static void record_loop(struct runtime *rxrun, struct runtime *txrun,
+								FILE *wavf, audio_mode_t mode)
+{
+	struct pollfd pfd;
+	struct sigaction sa;
+	int ret = 0;
+	int filesize = 0;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_flags = SA_NOCLDSTOP;
+	sa.sa_handler = sigint_handler;
+	sigaction(SIGINT, &sa, NULL);
+
+	if (mode == MODE_RECORD) printf("Recording..\n");
+
+	for(;;) {
+		if (!record_next_period(rxrun)) goto cont;
+
+		pfd.fd = rxrun->fd;
+		pfd.events = POLLIN | POLLRDNORM;
+
+		ret = poll(&pfd, 1, 500);
+
+		rxrun->enable = 0; 
+		txrun->enable = 0;
+
+		if (ret > 0) {
+			if (pfd.revents & POLLRDNORM) {
+				if (mode == MODE_RECORD) {
+					filesize += write_period(rxrun, wavf);
+					rxrun->enable = 1;
+					rxrun->count++;
+				}
+				if (mode == MODE_REALTIME) {
+					txrun->current = rxrun->current;
+					txrun->enable = 1;
+					play_next_period(txrun, 1);
+					rxrun->enable = 1;
+					rxrun->count++;
+				}
+			}
+		} else {
+			printf("timeout\n");
+		}
+
+cont:
+		if (signal_received == SIGINT) break;
+	}
+
+	printf("Interrupted\n");
+	/* finalize -- add size */
+	if (mode == MODE_RECORD) {
+		filesize -= 4;
+		printf("size: %d\n", filesize);
+		fseek(wavf, 0x4, SEEK_SET);
+		fwrite(&filesize, 4, 1, wavf);
+		filesize += 0x24; // header size
+		fseek(wavf, 0x28, SEEK_SET);
+		fwrite(&filesize, 4, 1, wavf);
+	}
+}
+
+
+static int set_audio_data(struct runtime *tx, FILE *wavf)
+{
+	unsigned long d;
+	int i, in, ret; 
+
+	if (tx->count == 3) i = in = 0;
+	else i = in = tx->count * BUFSIZE/4;
+
+	ret = 0; d = 0;
+	while (i < in + BUFSIZE/4) {
+		if (i % 2) {                  // left
+			ret = fread(&d, 3, 1, wavf);
+			if (!ret) { ret = -1; break; } // end of file
+			// to set 1st 4 Bytes sample as left 
+			tx->buf[i] = d;   			
+			//printf("%08x\n", tx->buf[i-1]);
+		} else {
+			if (i > 0) tx->buf[i] = 0;			// right
+			fseek(wavf, ftell(wavf) + 3, SEEK_SET); // skip 3bytes
+		}
+		i++; 
+	}
+
+	return ret;
+}
+
+
+static void play_loop(struct runtime *tx, FILE *wavf)
+{
+	struct pollfd pfd;
+	struct sigaction sa;
+	int ret = 0; int i;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_flags = SA_NOCLDSTOP;
+	sa.sa_handler = sigint_handler;
+	sigaction(SIGINT, &sa, NULL);
+
+	fseek(wavf, 0x2C, SEEK_SET); // skip to content
+	set_audio_data(tx, wavf);
+
+	for (;;) {
+		if (!play_next_period(tx, 0)) goto cont;
+	
+		pfd.fd = tx->fd;
+		pfd.events = POLLOUT | POLLWRNORM;
+		
+		ret = poll(&pfd, 1, 500);
+
+		tx->enable = 0;
+		if (ret > 0) {
+			if (pfd.revents & POLLWRNORM) {
+				if (set_audio_data(tx, wavf) < 0) break;
+				tx->enable = 1;
+			}
+		} else {
+			printf("timeout\n"); break;
+		}
+
+cont:
+		if (signal_received == SIGINT) break;
+	} 
+}
+
 int main(int argc, char **argv)
 {
 	struct runtime *rxrun, *txrun;
-	struct pollfd fds[2];
 	audio_mode_t mode;
 	FILE *wavf;
 
 	int i, ret;
-	unsigned long filesize;
 
 	if (argc < 2) {
 		printf("usage: %s <mode>\n", argv[0]);	
@@ -272,9 +399,20 @@ int main(int argc, char **argv)
 		}
 		if (init_wav(wavf) <= 0) return -1;
 		mode = MODE_RECORD;
-		filesize = 0;
+	} else if (!strcmp(argv[1], "play")) {
+		if (argc < 3) {
+			printf("Specify file name\n");
+			return 1;
+		}
+		wavf = fopen(argv[2], "r");
+		if (!wavf) {
+			printf("Can't open \"%s\"\n", argv[2]);
+			return -1;
+		}
+		mode = MODE_PLAY;
+	} else { 
+		mode = MODE_REALTIME;
 	}
-	else mode = MODE_REALTIME;
 
 	rxrun = malloc(sizeof(*rxrun));
 	txrun = malloc(sizeof(*txrun));
@@ -290,7 +428,7 @@ int main(int argc, char **argv)
 	if(init_devices(rxrun, txrun) < 0) return -1;
 
 	/* Begin */
-	initialize(rxrun, txrun, mode);
+	init_mode(rxrun, txrun, mode);
 
 	if (mode == MODE_PLAY_FIX) {
 		generate_sine(txrun->buf);
@@ -300,72 +438,12 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_flags = SA_NOCLDSTOP;
-	sa.sa_handler = sigint_handler;
-	sigaction(SIGINT, &sa, NULL);
+	if (mode == MODE_RECORD || mode == MODE_REALTIME)
+		record_loop(rxrun, txrun, wavf, mode);	
+	else if (mode == MODE_PLAY)
+		play_loop(txrun, wavf);
 
-	for(;;) {
-		record_next_period(rxrun);
-
-		fds[0].fd = rxrun->fd;
-		fds[0].events = POLLIN | POLLRDNORM;
-		fds[1].fd = txrun->fd;
-		fds[1].events = POLLOUT | POLLWRNORM;
-
-		ret = poll(fds, 1, 500);
-
-		rxrun->enable = 0; 
-		txrun->enable = 0;
-
-		if (ret > 0) {
-			printf("polled\n");
-			if (fds[0].revents & POLLRDNORM) {
-				printf("RX\n");
-				if (mode == MODE_PLAY) continue;
-				if (mode == MODE_RECORD) {
-					filesize += write_period(rxrun, wavf);
-					rxrun->enable = 1;
-					rxrun->count++;
-#if 0
-					for (i = 0; i < BUFSIZE/4; i++) 
-						printf("%d: %08x\n", i, rxrun->buf[i]);
-#endif
-				}
-				if (mode == MODE_REALTIME) {
-					txrun->current = rxrun->current;
-					txrun->enable = 1;
-					play_next_period(txrun, 1);
-					rxrun->enable = 1;
-					rxrun->count++;
-				}
-			}
-			if (fds[1].revents & POLLWRNORM) {
-				printf("TX\n");
-				if (mode == MODE_PLAY) {
-					txrun->count++;
-					txrun->enable = 1;
-				}
-			}
-		} else {
-			printf("timeout\n");
-		}
-
-		if (signal_received == SIGINT) break;
-	}
-
-	printf("Interrupted\n");
-	if (mode == MODE_RECORD) {
-		char buf[8];
-		printf("size: %d\n", filesize);
-		fseek(wavf, 0x24, SEEK_SET);
-		fwrite(&filesize, 4, 1, wavf);
-		filesize += 0x24;
-		fseek(wavf, 0x4, SEEK_SET);
-		fwrite(&filesize, 4, 1, wavf);
-	}
-
-	fclose(wavf);
+	if (mode == MODE_RECORD || mode == MODE_PLAY) fclose(wavf);
+	free(rxrun); free(txrun);
 	return 0;
 }
