@@ -59,7 +59,7 @@ struct runtime {
 	int fd;
 	int count;
 	int enable;
-	FILE **wav_file;
+	FILE *wav_file;
 };
 
 typedef enum {
@@ -325,8 +325,7 @@ static void finalize_wav(FILE *file, int filesize)
 		fwrite(&filesize, 4, 1, file);
 }
 
-static void record_loop(struct runtime *rxrun, struct runtime *txrun,
-								FILE *wavf)
+static void record_loop(struct runtime *rxrun, struct runtime *txrun)
 {
 	struct pollfd pfd;
 	struct sigaction sa;
@@ -355,7 +354,7 @@ static void record_loop(struct runtime *rxrun, struct runtime *txrun,
 			if (pfd.revents & POLLRDNORM) {
 				if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD ||
 					 mode == MODE_PLAY_FIX_RECORD) {
-					filesize += write_period(rxrun, wavf);
+					filesize += write_period(rxrun, rxrun->wav_file);
 					rxrun->enable = 1;
 					rxrun->count++;
 				}
@@ -378,12 +377,12 @@ cont:
 	printf("Interrupted\n");
 	/* finalize -- add size */
 	if (mode == MODE_RECORD) {
-		finalize_wav(wavf, filesize);
+		finalize_wav(rxrun->wav_file, filesize);
 	}
 }
 
 
-static int set_audio_data(struct runtime *tx, FILE *wavf)
+static int set_audio_data(struct runtime *tx)
 {
 	unsigned long d;
 	int i, offset, ret; 
@@ -394,7 +393,7 @@ static int set_audio_data(struct runtime *tx, FILE *wavf)
 	ret = 0; d = 0;
 	while (i < offset + BUFSIZE/4) {
 		if (mode == MODE_PLAY || mode == MODE_PLAY_RECORD) {
-			ret = fread(&d, 3, 1, wavf);
+			ret = fread(&d, 3, 1, tx->wav_file);
 			if (!ret) { ret = -1; break; } // end of file
 			tx->buf[i] = d;   			
 		} else if (mode == MODE_PLAY_FIX || mode == MODE_PLAY_FIX_RECORD) {
@@ -408,7 +407,7 @@ static int set_audio_data(struct runtime *tx, FILE *wavf)
 }
 
 
-static void play_loop(struct runtime *tx, FILE *wavf)
+static void play_loop(struct runtime *tx)
 {
 	struct pollfd pfd;
 	struct sigaction sa;
@@ -420,8 +419,8 @@ static void play_loop(struct runtime *tx, FILE *wavf)
 	sigaction(SIGINT, &sa, NULL);
 
 	if (mode == MODE_PLAY || mode == MODE_PLAY_RECORD) {
-		fseek(wavf, 0x2c, SEEK_SET); // skip to content
-		set_audio_data(tx, wavf);
+		fseek(tx->wav_file, 0x2c, SEEK_SET); // skip to content
+		set_audio_data(tx);
 	}
 
 	for (;;) {
@@ -436,7 +435,7 @@ static void play_loop(struct runtime *tx, FILE *wavf)
 		if (ret > 0) {
 			if (verbose) printf("TX polled\n");
 			if (pfd.revents & POLLWRNORM) {
-				if (set_audio_data(tx, wavf) < 0) break;
+				if (set_audio_data(tx) < 0) break;
 				tx->enable = 1;
 				tx->count++;
 			}
@@ -455,15 +454,12 @@ void *record_thread(void *arg)
 	struct runtime *rx = arg;
 	printf("entering record thread\n");
 
-	record_loop(rx, NULL, *(rx->wav_file));
+	record_loop(rx, NULL);
 }
 
 int main(int argc, char **argv)
 {
 	struct runtime *rxrun, *txrun;
-	FILE *wavf; 
-	FILE *p_wavf;
-	FILE *r_wavf;
 	pthread_t record_thread_id;
 	int i, j, ret;
 	unsigned long *coefbuf;
@@ -472,6 +468,15 @@ int main(int argc, char **argv)
 		printf("usage: %s <mode>\n", argv[0]);	
 		return 1;
 	}
+
+	rxrun = malloc(sizeof(*rxrun));
+	txrun = malloc(sizeof(*txrun));
+	if (!rxrun || !txrun) {
+		printf("Can't allocate runtime structure\n");
+		return -1;
+	}
+	
+	rxrun->wav_file = NULL; txrun->wav_file = NULL;
 
 	if (!strcmp(argv[1], "real")) {
 		mode = MODE_REALTIME;
@@ -485,20 +490,20 @@ int main(int argc, char **argv)
 		printf("sinmult : %d\n", sinmult);
 		if (sinmult == -1) fixtype = FIX_IMPULSE;
 	} else if (!strcmp(argv[1], "rec")) {
-		if (argc < 3) {
-			printf("Specify file name\n");
-			return 1;
-		}
-		if ((wavf = open_wav(argv[2], "wb+")) == NULL) return -1;
-		if (init_wav(wavf) <= 0) { printf("File init failed\n"); return -1; }
 		mode = MODE_RECORD;
-	} else if (!strcmp(argv[1], "play")) {
 		if (argc < 3) {
 			printf("Specify file name\n");
 			return 1;
 		}
-		if ((wavf = open_wav(argv[2], "r")) == NULL) return -1;
+		if ((rxrun->wav_file = open_wav(argv[2], "wb+")) == NULL) return -1;
+		if (init_wav(rxrun->wav_file) <= 0) { printf("File init failed\n"); return -1; }
+	} else if (!strcmp(argv[1], "play")) {
 		mode = MODE_PLAY;
+		if (argc < 3) {
+			printf("Specify file name\n");
+			return 1;
+		}
+		if ((txrun->wav_file = open_wav(argv[2], "r")) == NULL) return -1;
 	} else if (!strcmp(argv[1], "playrec")) {
 		mode = MODE_PLAY_RECORD;
 		if (argc < 4) {
@@ -510,11 +515,11 @@ int main(int argc, char **argv)
 			fix_data_generate(); 
 			mode = MODE_PLAY_FIX_RECORD;
 		} else {
-			if ((p_wavf = open_wav(argv[2], "r")) == NULL) return -1;
+			if ((txrun->wav_file = open_wav(argv[2], "r")) == NULL) return -1;
 		}
 
-		if ((r_wavf = open_wav(argv[3], "wb+")) == NULL) return -1;
-		if (init_wav(r_wavf) <= 0) { printf("File init failed\n"); return -1; }
+		if ((rxrun->wav_file = open_wav(argv[3], "wb+")) == NULL) return -1;
+		if (init_wav(rxrun->wav_file) <= 0) { printf("File init failed\n"); return -1; }
 	}
 
 	for (i = 0; i < argc; i++) {
@@ -527,13 +532,6 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "-v")) {
 			verbose = 1;
 		}
-	}
-
-	rxrun = malloc(sizeof(*rxrun));
-	txrun = malloc(sizeof(*txrun));
-	if (!rxrun || !txrun) {
-		printf("Can't allocate runtime structure\n");
-		return -1;
 	}
 
 	/* Allocate buffers */
@@ -561,17 +559,16 @@ int main(int argc, char **argv)
 	if (mode == MODE_NONE) goto finish;
 
 	if (mode == MODE_RECORD || mode == MODE_REALTIME)
-		record_loop(rxrun, txrun, wavf);
+		record_loop(rxrun, txrun);
 	else if (mode == MODE_PLAY || mode == MODE_PLAY_FIX)
-		play_loop(txrun, wavf);
+		play_loop(txrun);
 	else if (mode == MODE_PLAY_RECORD || mode ==  MODE_PLAY_FIX_RECORD) {
-		rxrun->wav_file = &r_wavf;
 		/* use pthread */	
 		if (pthread_create(&record_thread_id, NULL, record_thread, (void *)rxrun)) {
 			fprintf(stderr, "Error creating thread\n");
 			return 1;
 		} else {
-			play_loop(txrun, p_wavf);
+			play_loop(txrun);
 		}
 
 		if (pthread_join(record_thread_id, NULL)) {
@@ -580,9 +577,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (mode == MODE_RECORD || mode == MODE_PLAY) fclose(wavf);
-	if (mode == MODE_PLAY_RECORD) { fclose(p_wavf); fclose(r_wavf); }
-	if (mode == MODE_PLAY_FIX_RECORD) { fclose(r_wavf); }
+	if (txrun->wav_file) fclose(txrun->wav_file);
+	if (rxrun->wav_file) fclose(rxrun->wav_file);
 
 finish:
 	free(rxrun); free(txrun);
