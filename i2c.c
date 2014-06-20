@@ -12,6 +12,8 @@
 #define CLKCTRL_SRC_PLL  0x8
 #define CLKCTRL_DISABLE  0x0
 
+static int verbose = 0;
+
 static int pll_read(int fd) {
 	int ret = 0;
 	uint8_t buf[8];
@@ -26,10 +28,12 @@ static int pll_read(int fd) {
 	ret = read(fd, buf, 8);
 	if (ret < 0) { printf("Read failed, errno = %d\n", errno); }
 	else {
-		printf("Read ret: %d\n", ret);
-		printf("PLL: (%02x%02x) %02x%02x %02x%02x %02x%02x\n",
-				 buf[0], buf[1], buf[2], buf[3], 
-				 buf[4], buf[5], buf[6], buf[7]);
+		if (verbose) {
+				printf("Read ret: %d\n", ret);
+				printf("PLL: (%02x%02x) %02x%02x %02x%02x %02x%02x\n",
+						 buf[0], buf[1], buf[2], buf[3], 
+						 buf[4], buf[5], buf[6], buf[7]);
+		}
 	}
 
 	return ret;
@@ -44,7 +48,7 @@ static int write_command(int fd, uint8_t *cmd, int len, const char *name) {
 	ret = write(fd, cmd, len);
 	if (ret < len) { printf("Can't write: %d\n", errno); close(fd); return ret; }
 
-	printf("Command: \"%s\" Written successfully\n", name);
+	if (verbose) printf("Command: \"%s\" Written successfully\n", name);
 	return 0;
 }
 
@@ -58,7 +62,11 @@ int main(int argc, char **argv) {
 	int fd, ret;
 	uint8_t *buf;
 	uint8_t mx0, mx1;	
-	int val;
+	int val, i;
+
+	for (i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "-v")) verbose = 1;
+	}	
 	
 	fd = open("/dev/i2c-0", O_RDWR);
 	if (fd < 0) return 1;
@@ -73,8 +81,14 @@ int main(int argc, char **argv) {
 	usleep(10000);
 
 #if 1
+
 	/* Write configuration values */
 	uint8_t pllbuf[] = { 0x40, 0x02, 0x02, 0x71, 0x01, 0xDD, 0x19, 0x01 };
+	if (argc > 1 && !strcmp(argv[1], "48khz")) {
+		pllbuf[2] = 0x00; pllbuf[3] = 0x7D;
+		pllbuf[4] = 0x00; pllbuf[5] = 0x0C;
+		pllbuf[6] = 0x21; pllbuf[7] = 0x01;
+	}
 	write_command(fd, pllbuf, 8, "WRITE PLL CMD");
 
 	/* wait */
@@ -85,10 +99,10 @@ int main(int argc, char **argv) {
 	write_command(fd, buf, 3, "ENABLE CORE");
 
 	/* wait */
-	usleep(65000);
+	usleep(10000);
 	
 	/* Read out of curiosity */
-	pll_read(fd);
+	//pll_read(fd);
 
 	usleep(10000);
 	
@@ -124,7 +138,7 @@ int main(int argc, char **argv) {
 
 	if (argc > 2 && !strcmp(argv[1], "davol")) {
 		int vol = atoi(argv[2]);
-		if (vol < 0) {
+		if (vol <= 0) {
 			val = -1 * vol;
 		}
 	} else {
@@ -154,13 +168,13 @@ int main(int argc, char **argv) {
    /*			                                  |-> to playback */
 	/* LDVOL Control (Differential Control) */
 	/* LDVOL[5:0] | LDMUTE | LDEN */
-	val = (0x40 << 2) | (1 << 1) | 1;
+	val = (0x3F << 2) | (1 << 1) | 1;
 	construct_cmd(0x0E, val, buf);
 	write_command(fd, buf, 3, "LEFT DIFF INPUT VOL CONTROL");
 
 	usleep(10000);
 
-#define ALC
+//#define ALC
 #ifdef ALC
 	/* PGASLEW[1:0] | ALCMAX[2:0] | ALCSEL[2:0] */
 	/* ALCSEL : 000 => off, 001 => Right, 010 => Left, 011 => Stereo */
@@ -313,6 +327,7 @@ int main(int argc, char **argv) {
 	write_command(fd, buf, 3, "SERIAL OUTPUT ROUTE");
 #endif
 #endif
+	printf("Set OK.\n");
 	
 	close(fd);
 	return 0;
