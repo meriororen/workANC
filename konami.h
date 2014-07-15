@@ -1,3 +1,8 @@
+#ifndef ANC_KONAMI_H
+#define ANC_KONAMI_H
+
+#include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -12,8 +17,12 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 #include <pthread.h>
+
+//#include "lms.h"
+#include "orz_lms.h"
 
 #define PAGE_SIZE 0x1000
 
@@ -25,8 +34,8 @@
 #define TX_BASE 	0xD0000000
 
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
-#define BUFSIZE 	CHANNELS * 440 * WORDSIZE 
-#define BUFCOUNT  3
+#define BUFSIZE 	CHANNELS * 55 * WORDSIZE 
+#define BUFCOUNT 8
 
 /* ioctl definition */
 #define KONAMI_MAGIC 0xBA
@@ -45,15 +54,14 @@
 
 /* FIR Coefficient */
 #define COEF_BASE 0xFF241000
-#define COEF_COUNT 37
+#define COEF_COUNT 63
 
 /* Ping-pong buffer for delay */
 #define MAX_DELAY 1024
-#define DELAYSIZE 5500
+#define DELAYSIZE 6992
 
 /* Sign extend */
-#define sext(a) \
-	(a & 0x800000) ? a |= 0xFF000000 : a
+#define sext(x) (x & 0x800000 ? x | 0xFF000000 : x & 0x00FFFFFF)
 
 struct descriptor {
 	uint32_t read_address;
@@ -69,6 +77,7 @@ struct runtime {
 	int count;
 	int enable;
 	FILE *wav_file;
+	unsigned int filesize; /* for rx only */
 };
 
 typedef enum {
@@ -82,28 +91,36 @@ typedef enum {
 	MODE_LMS_LEARN,
 } audio_mode_t;
 
-typedef enum {
-	STATE_IDLE,
-	STATE_LEARNING,
-} audio_state_t;
+#define FIX_SINE 0
+#define FIX_IMPULSE 1
 
-typedef enum {
-	FIX_SINE,
-	FIX_IMPULSE,
-} fix_type_t;
+extern audio_mode_t mode;
+extern int fixtype;
+extern int delaysize;
 
-static int *delay;
-static int delaycount;
-static int samplecount = 0;
-static volatile int signal_received;
-static audio_mode_t mode = MODE_NONE;
-static int sinmult;
-static int verbose = 0;
-static int fix_samples[BUFSIZE/4]; // for left and right
-fix_type_t fixtype = FIX_SINE;
-static int interval = 0;
-static int filter_taps[COEF_COUNT];
-static audio_state_t state = STATE_IDLE;
+lms_t *target;
+FILE *buffer1;
+FILE *buffer2;
+
+void record_loop(struct runtime *rxrun, struct runtime *txrun);
+void play_loop(struct runtime *tx);
+
+static inline double fix2fl(int s) 
+{
+	const double Q = 1.0F / (0x00000000007fffff + 0.5);
+	return (double) s * Q;
+}
+
+static inline int fl2fix(double s)
+{
+	return (int) ceil(s * (0x00000000007fffffF + 0.5));
+}
+
+static inline int fl2fix26(double s)
+{
+	return (int) ceil(s * (0x00000000007ffffF + 0.5));
+	//return (int) ceil(s * (0x0000000001fffffF + 0.5));
+}
 
 static FILE * open_file(const char *filename, const char *mode) 
 {
@@ -117,7 +134,7 @@ static FILE * open_file(const char *filename, const char *mode)
 	return file;
 }
 
-static size_t init_wav(FILE *file)
+static size_t init_wav(FILE *file, int stereo)
 {
 	/* Create header */
 	char sample_header[] = {
@@ -133,6 +150,14 @@ static size_t init_wav(FILE *file)
 		0x64, 0x61, 0x74, 0x61, /* "data" */
 		0x00, 0x00, 0x00, 0x00, /* Data chunk size (Size - 0x24) */
 	};
+
+	if (!stereo) {
+		sample_header[22] = 0x01;
+		sample_header[28] = 0xCC;
+		sample_header[29] = 0x04;
+		sample_header[30] = 0x02;
+		sample_header[32] = 0x03;
+	}
 
 	return fwrite(sample_header, 1, sizeof(sample_header), file);
 }
@@ -179,3 +204,4 @@ static void init_mode(struct runtime *rxrun, struct runtime *txrun)
 	txrun->count = 0;	
 }
 
+#endif

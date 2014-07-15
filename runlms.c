@@ -7,7 +7,7 @@
 #include "fop.h"
 
 #define BUFSIZE 1024
-#define TAPSIZE 37
+#define TAPSIZE 63
 
 #define HEADER_SIZE
 

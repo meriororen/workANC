@@ -7,8 +7,6 @@
 #define _ORZ_lms_H_
 
 #define MU           0.01
-
-
 typedef struct {
 	bool	ready;	
 	int		tap;	

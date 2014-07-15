@@ -12,7 +12,7 @@ static lms_t *target;
 
 #undef BUFSIZE
 #define BUFSIZE 1024
-#define TAPSIZE 37
+#define TAPSIZE 63
 
 #define FLOAT 0
 
