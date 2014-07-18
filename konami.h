@@ -34,11 +34,8 @@
 #define TX_BASE 	0xD0000000
 
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
-#define BUFSIZE 	CHANNELS * 110 * WORDSIZE 
-#define BUFCOUNT 2
-
-/* LMS */
-#define LMS_SIZE 20000
+#define BUFSIZE 	CHANNELS * 55 * WORDSIZE 
+#define BUFCOUNT 8
 
 /* ioctl definition */
 #define KONAMI_MAGIC 0xBA
@@ -57,7 +54,7 @@
 
 /* FIR Coefficient */
 #define COEF_BASE 0xFF241000
-#define COEF_COUNT 100
+#define COEF_COUNT 63
 
 /* Ping-pong buffer for delay */
 #define MAX_DELAY 1024
@@ -73,24 +70,14 @@ struct descriptor {
 	uint32_t control;
 };
 
-struct audio_buf {
-	unsigned long address;
-	int notify;
-	pthread_t worker;
-	pthread_cond_t cond;
-	pthread_mutex_t mutex;
-};
-
 struct runtime {
-	int fd;						/* device file descriptor */
 	unsigned long current;
-	unsigned long *buf;		/* pointer to memory-mapped buffer */
-	int count;					/* buffer counter */
-	int enable;					
+	unsigned long *buf;
+	int fd;
+	int count;
+	int enable;
 	FILE *wav_file;
-	unsigned int filesize;  /* for rx only */
-
-	struct audio_buf rbuf[2];	   /* real buffer */
+	unsigned int filesize; /* for rx only */
 };
 
 typedef enum {
@@ -115,8 +102,6 @@ lms_t *target;
 FILE *buffer1;
 FILE *buffer2;
 
-static void receive_period(struct runtime *run, int bufnum);
-static int set_period(struct runtime *run);
 void record_loop(struct runtime *rxrun, struct runtime *txrun);
 void play_loop(struct runtime *tx);
 
