@@ -3,21 +3,27 @@
 #include <arpa/inet.h>
 #include "konami.h"
 
-#define IMP_INTERVAL 500
+#define IMP_INTERVAL 400
 
 static int sinmult;
 static int filter_taps[COEF_COUNT];
 
-audio_mode_t mode = MODE_NONE;
 int fix_samples[BUFSIZE/4]; 
 int fixtype = 0;
 int delaysize = 0;
 static int delaycount;
-static unsigned int samplecount = 0;
 static volatile int signal_received;
-static int xfilled = 0;
-static int yfilled = 0;
 static int interval;
+static unsigned int samplecount = 0;
+
+extern char *optarg;
+
+#define CALIBUFSIZE 512
+int calibuf0[CALIBUFSIZE];
+int calibuf1[CALIBUFSIZE];
+int calibc0 = 0; int calibc1 = 0;
+
+int literal = 0;
 
 int verbose = 0;
 #define IMP_DATA 0x7fffff
@@ -35,10 +41,15 @@ static void fix_data_generate(int type)
 			fix_samples[i] = (int) AMPLITUDE * sin(currentPhase);
 			currentPhase += phaseInc;
 		} else if (type == FIX_IMPULSE) {
-			if (i == 0 || i == 1) fix_samples[i] = IMP_DATA;
+			if (i == 0) fix_samples[i] = IMP_DATA;
 			else fix_samples[i] = 0;
 		}
 	}
+
+//
+//	for (i = 0; i < BUFSIZE/4; i++) {
+//		printf("%08x\n", fix_samples[i]);
+//	}
 }
 
 static int map_buffers(struct runtime *rx, struct runtime *tx)
@@ -67,16 +78,21 @@ static int map_buffers(struct runtime *rx, struct runtime *tx)
 	return 0;
 }
 
-static int map_coef_buffer(unsigned long **addr) 
+static int map_coef_buffer(unsigned long **addr, int modnum) 
 {
+	unsigned long coef_base;
+
 	int fd = open("/dev/mem", O_RDWR);
 	if (!fd) {
 		printf("Can't open /dev/mem\n");
 		return -1;
 	}
+
+	if (modnum == 1) coef_base = 0xff241000;
+	else coef_base = 0xff251000;
 	
 	*addr = mmap(NULL, 0x1000, PROT_WRITE | PROT_READ,
-					MAP_SHARED, fd, COEF_BASE);
+					MAP_SHARED, fd, coef_base);
 
 	if (addr == MAP_FAILED) {
 		printf("Failed to map FIR coefficient buffer\n");
@@ -87,16 +103,38 @@ static int map_coef_buffer(unsigned long **addr)
 	return 0;
 }
 
+//#define I2S_MASTER
+#ifdef I2S_MASTER
+static int enable_i2s(void) 
+{
+	int fd = open("/dev/mem", O_RDWR);
+	if (!fd) {
+		printf("Can't open /dev/mem\n");
+		return -1;
+	}
+	
+	unsigned long *addr = mmap(NULL, 0x1000, PROT_WRITE | PROT_READ,
+					MAP_SHARED, fd, I2S_BASE);
+
+	if (addr == MAP_FAILED) {
+		printf("Failed to map I2S config\n");
+		return -1;
+	}
+
+	/* enable */
+	addr[4] = 0x1;	
+
+	munmap(addr, 0x1000);
+	
+	close(fd);
+	
+	return 0;
+}
+#endif
+
 static void sigint_handler(int sig)
 {
 	signal_received = sig;
-}
-
-static int trigger = 0;
-
-static void sigusr2_handler(int sig)
-{
-	trigger = 1;
 }
 
 static inline void next_addr(struct runtime *run, unsigned long addr)
@@ -162,77 +200,85 @@ static int record_next_period(struct runtime *run)
 	return 1;
 }
 
-static int init_devices(struct runtime *rx, struct runtime *tx)
+static int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
 {
-	rx->fd = open("/dev/c1capt", O_RDWR);
+	char devpath[16];
+	
+	sprintf(devpath, "/dev/c%dcapt", modulenum);
+
+	rx->fd = open(devpath, O_RDWR);
 	if (rx->fd < 0) {
-		printf("Can't open /dev/c1capt\n");
+		printf("Can't open %s\n", devpath);
 		return -1;
 	} 
 
-	tx->fd = open("/dev/c1play", O_RDWR);
+	sprintf(devpath, "/dev/c%dplay", modulenum);
+
+	tx->fd = open(devpath, O_RDWR);
 	if (tx->fd < 0) {
-		printf("Can't open /dev/c1play\n");
+		printf("Can't open %s\n", devpath);
 		return -1;
 	}
 }
 
 /* Receive one period (1 buffer full = 0.01 s) of data from ADC */
 
-static int receive_period(struct runtime *run, FILE *file)
+static void receive_period(struct runtime *rx, struct runtime *tx)
 {
 	int offset, i, c, j;
 	char buf[3];
 	int total = 0;
-	offset = i = run->count * BUFSIZE/4;
-	int wbuf[BUFSIZE/4];
+	offset = i = rx->count * BUFSIZE/4;
+	static int _x = 0;
 
 	while (i < offset + BUFSIZE/4) {
-		int x = run->buf[i];
+		int x = rx->buf[i];
+		int left = !(i % 2);
+		bool waitfordelay = (samplecount <= delaysize);
 		buf[0] = x & 0xff;
 		buf[1] = (x >> 8) & 0xff;
 		buf[2] = (x >> 16) & 0xff;
 	
-		// be sure to set DA volume attenuation to 0 before calibrating delay
-		if (buf[2] < 0xb0 && x < 0 && mode == MODE_PLAY_FIX_RECORD) {
-			//delaysize = samplecount;
-			printf("samplecount: %d [dc: %d] x: %08x i: %d count: %d\n", 
-				samplecount, delaycount, x, i - offset, run->count);
-		}
-
-#if 1
-		if (mode == MODE_LMS_LEARN && samplecount > delaysize) {
-			//
-			if (target->vcount <= target->max) {
-				if (!(i % 2) && !yfilled) 
-					target->v[target->vcount++] = fix2fl(sext(x));
-			} else {
-				yfilled = 1;
-			}
-
-			if (xfilled && yfilled && !target->ready) {
-				lms_learn(target);
-#if 1
-				for (j = 0; j < target->max; j++) {
-					fwrite(&target->x[j], sizeof(double), 1, buffer1);
-					fwrite(&target->v[j], sizeof(double), 1, buffer2);
+		if (signal_received == SIGINT) break;
+		switch (mode) {
+			case MODE_PLAY_FIX_RECORD:
+				if (x - _x > 0x600000 && x > 0) {
+					printf("samplecount: %d [dc: %d] x: %08x _x: %08x dx: %08x i: %d count: %d\n", 
+						samplecount, delaycount, x, _x, x - _x, i - offset, rx->count);
 				}
-#endif
-				lms_complete(target);
-				signal_received = SIGINT;
-			}
+				_x = x;	
+				break;
+			case MODE_LMS_LEARN:
+				if ((!waitfordelay && left) && target->xcount < target->max)
+					target->x[target->xcount++] = fix2fl(sext(x));
+				break;
+			case MODE_PLAY_RECORD:
+				if (calibc1 < CALIBUFSIZE) {
+					if (left) calibuf1[calibc1++] = sext(x);
+				} else {
+					int q;
+					for(j = 0; j < CALIBUFSIZE; j++) {
+						if (calibuf0[j] == 0x7fffff) q = 0;
+						if (calibuf1[j] - calibuf1[j-1] > 0x200000) {
+							 printf("delay = %d\n", q);
+						}
+						q++;
+					}
+					signal_received = SIGINT;
+				}
+				break;
+			default:
+				break;
 		}
-#endif
-	
-		if (samplecount > delaysize && 
-			 mode != MODE_PLAY_FIX_RECORD) {
-				total += fwrite(buf, sizeof(buf), 1, file);
+
+
+		if (!waitfordelay) {
+			rx->filesize += fwrite(buf, 1, sizeof(buf), rx->wav_file);
 		}
-		if (i % 2) samplecount ++;
+
+		if (left) samplecount++;
 		i++;
 	}
-
-	return total * (sizeof(buf));
 }
 
 /* Set one period (1 buffer full = 0.01 s) of data to DAC */
@@ -248,9 +294,10 @@ static int set_period(struct runtime *tx)
 	ret = 0; d = 0;
 	if (verbose) printf("i = %d\n", i);
 	while (i < offset + BUFSIZE/4) {
+		int left = !(i % 2);
 		switch (mode) {
 			case MODE_PLAY:
-		 	case MODE_PLAY_RECORD:
+			case MODE_PLAY_RECORD:
 			case MODE_LMS_LEARN:
 				if (feof(tx->wav_file)) { 
 					if (verbose) printf("End of File\n");
@@ -258,27 +305,21 @@ static int set_period(struct runtime *tx)
 				}
 				fread(&d, 3, 1, tx->wav_file);
 				tx->buf[i] = d;   			
-				if (!(i % 2) && mode == MODE_LMS_LEARN) {
-					if (target->xcount < target->max && !xfilled) { 
-						target->x[target->xcount++] = fix2fl(sext(d));
-					} else {
-						xfilled = 1;
-					}
+				if (calibc0 < CALIBUFSIZE && left) calibuf0[calibc0++] = d;
+				if (left && mode == MODE_LMS_LEARN) {
+					if (target->vcount < target->max && !target->ready) { 
+						target->v[target->vcount++] = fix2fl(sext(d));
+					} 
 				}
-				//if (interval == 10) samplecount = 0;
 				break;
 			case MODE_PLAY_FIX:
 			case MODE_PLAY_FIX_RECORD:
 				tx->buf[i] = fix_samples[i - offset];
-				if (mode == MODE_PLAY_FIX_RECORD || mode == MODE_LMS_LEARN) {
-					if (trigger == 1) {
-						samplecount = 0;
-						trigger = 0;
+				if (mode == MODE_PLAY_FIX_RECORD && fixtype == FIX_IMPULSE) {
+					if (tx->buf[i] == IMP_DATA && interval == IMP_INTERVAL) {
+						// samplecount = 0;
 					}
-					if (fixtype == FIX_IMPULSE && fix_samples[i - offset] == IMP_DATA) {
-						if (interval == IMP_INTERVAL) samplecount = 0;
-						else tx->buf[i] = 0;
-					}
+					else tx->buf[i] = 0;
 				}
 				break;
 			default:
@@ -297,7 +338,6 @@ void record_loop(struct runtime *rxrun, struct runtime *txrun)
 	struct sigaction sa;
 	int ret = 0;
 
-	yfilled = 0;
 	rxrun->filesize = 0;
 
 	memset(&sa, 0, sizeof(sa));
@@ -313,16 +353,39 @@ void record_loop(struct runtime *rxrun, struct runtime *txrun)
 		pfd.fd = rxrun->fd;
 		pfd.events = POLLIN | POLLRDNORM;
 
-		ret = poll(&pfd, 1, 11); // timeout >10ms (1 period)
+		ret = poll(&pfd, 1, 200); // timeout >10ms (1 period)
 
 		rxrun->enable = 0; 
 		if (txrun) txrun->enable = 0;
+
+		if (mode == MODE_LMS_LEARN && target->xcount >= target->max) {
+			int j;
+			FILE *errf;
+
+			lms_learn(target);
+
+			errf = fopen("error", "w");
+			for (j = 0; j < target->max; j++) {
+				if (literal) {
+					fprintf(buffer1, "%.7g\n", target->v[j]);
+					fprintf(buffer2, "%.7g\n", target->x[j]);
+				} else {
+					fwrite(&target->v[j], sizeof(double), 1, buffer1);
+					fwrite(&target->x[j], sizeof(double), 1, buffer2);
+				}
+				fprintf(errf, "%.7g\n", target->e[j]);
+				//printf("%.7g\n", target->y[j]);
+			}
+			fclose(errf);
+			lms_complete(target);
+			signal_received = SIGINT;
+		}
 
 		if (ret > 0) {
 			if (pfd.revents & POLLRDNORM) {
 				if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD ||
 					 mode == MODE_PLAY_FIX_RECORD || mode == MODE_LMS_LEARN) {
-					rxrun->filesize += receive_period(rxrun, rxrun->wav_file);
+					receive_period(rxrun, txrun);
 					rxrun->enable = 1;
 					rxrun->count++;
 				}
@@ -352,16 +415,12 @@ void play_loop(struct runtime *tx)
 {
 	struct pollfd pfd;
 	struct sigaction sa;
-	struct sigaction su;
 	int ret = 0; int i;
 
 	memset(&sa, 0, sizeof(sa));
-	memset(&su, 0, sizeof(su));
-	sa.sa_flags = su.sa_flags = SA_NOCLDSTOP;
+	sa.sa_flags = SA_NOCLDSTOP;
 	sa.sa_handler = sigint_handler;
-	su.sa_handler = sigusr2_handler;
 	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGUSR2, &su, NULL);
 	
 	tx->count = 0;
 
@@ -371,16 +430,15 @@ void play_loop(struct runtime *tx)
 	}
 
 	while (signal_received != SIGINT) {
-		if (mode == MODE_PLAY_FIX_RECORD) {
-			interval = interval == IMP_INTERVAL ? 0 : interval + 1;
-		}
+		if (mode == MODE_PLAY_FIX_RECORD) 
+			interval = (interval == IMP_INTERVAL ? 0 : interval + 1);
 
-		if (!play_next_period(tx, 0)) goto cont;
+		if (!play_next_period(tx, 0)) continue;
 	
 		pfd.fd = tx->fd;
 		pfd.events = POLLOUT | POLLWRNORM;
 		
-		ret = poll(&pfd, 1, 11); // timeout >10 ms (1 period)
+		ret = poll(&pfd, 1, 200); // timeout >10 ms (1 period)
 
 		tx->enable = 0;
 		if (ret > 0) {
@@ -394,11 +452,6 @@ void play_loop(struct runtime *tx)
 		} else {
 			printf("timeout\n"); break;
 		}
-
-cont:
-		if (trigger == 1){
-			 tx->enable = 1;
-		}	
 	} 
 }
 
@@ -407,7 +460,6 @@ cont:
 void *record_thread(void *arg) 
 {
 	struct runtime *rx = arg;
-	printf("entering record thread\n");
 
 	record_loop(rx, NULL);
 }
@@ -415,10 +467,33 @@ void *record_thread(void *arg)
 int main(int argc, char **argv)
 {
 	struct runtime *rxrun, *txrun;
-	pthread_t record_thread_id;
 	int i, j, ret, coef;
+	pthread_t record_thread_id;
 	unsigned long *coefbuf;
 	FILE *coeff = NULL;
+	int modnum = 1;
+	char record_filename[32] = "recorded.wav";
+	char response_data[16] = "res";
+	char reference_data[16] = "ref"; 
+	int nofilter = 0;
+
+	int option_index;
+	int c;
+	static const char short_options[] = "er::p:c:n:vd:i:m:N";
+	static const struct option long_options[] = {
+		{"real", 0, 0, 'e'},
+		{"record", 2, 0, 'r'},
+		{"play", 1, 0, 'p'},
+		{"playrec", 1, 0, 'c'},
+		{"learn", 1, 0, 'n'},
+		{"fix", 1, 0, 'f'},
+		{"verbose", 0, 0, 'v'},
+		{"delay", 1, 0, 'd'},
+		{"module", 1, 0, 'm'},
+		{"literal", 1, 0, 't'},
+		{"nofilter", 0, 0, 'N'},
+		{0, 0, 0, 0},
+	};
 
 	if (argc < 2) {
 		printf("usage: %s <mode>\n", argv[0]);	
@@ -431,73 +506,83 @@ int main(int argc, char **argv)
 		printf("Can't allocate runtime structure\n");
 		return -1;
 	}
-	
 	rxrun->wav_file = NULL; txrun->wav_file = NULL;
 
-	if (!strcmp(argv[1], "real")) {
-		mode = MODE_REALTIME;
-	} else if (!strcmp(argv[1], "fix")) {
-		if (argc < 3) {
-			printf("usage: %s fix [imp | <sine freq multiplier>]\n");
-			return 1;
+	while ((c = getopt_long(argc, argv, short_options, long_options, &option_index)) != -1) {
+		switch (c) {
+			case 't':
+				literal = 1;
+				break;
+			case 'm':
+				modnum = atoi(optarg);
+				break;
+			case 'v':
+				verbose = 1;
+				break;
+			case 'd':
+				delaysize = atoi(optarg);
+				break;
+			case 'e':
+				mode = MODE_REALTIME;
+				break;
+			case 'r':
+				mode = MODE_RECORD;
+				//strcpy(record_filename, optarg);
+				break;
+			case 'p':
+				mode = MODE_PLAY;
+				break;
+			case 'c':
+				mode = MODE_PLAY_RECORD;
+				if (strcmp(optarg, "imp") == 0) {
+					mode = MODE_PLAY_FIX_RECORD;
+				}
+				break;
+			case 'n':
+				mode = MODE_LMS_LEARN;
+				target = lms_init(COEF_COUNT, 40000, MU); /* lms_init(tap, max, mu) */
+				break;
+			case 'N':
+				nofilter = 1;
+				break;
+			case 'f':
+				if (strcmp(optarg, "imp") == 0) {
+					fixtype = FIX_IMPULSE;	
+				} else {
+					sinmult = atoi(optarg);
+				}
+				printf("fix mode %d\n", sinmult);
+				mode = MODE_PLAY_FIX;
+				fix_data_generate(fixtype);
+				break;
+			default:
+				break;
 		}
-		mode = MODE_PLAY_FIX; fixtype = FIX_SINE;
-		if (!strcmp(argv[2], "imp")) fixtype = FIX_IMPULSE; 
-		else sinmult = atoi(argv[2]);
 
-		fix_data_generate(fixtype);
-	} else if (!strcmp(argv[1], "rec")) {
-		mode = MODE_RECORD;
-		if (argc < 3) {
-			printf("Specify file name\n");
-			return 1;
+		if (mode == MODE_PLAY || mode == MODE_PLAY_RECORD || mode == MODE_LMS_LEARN) {
+			if (txrun->wav_file == NULL) {
+				if((txrun->wav_file = open_file(optarg, "r")) == NULL) return -1;
+			}
 		}
-		if ((rxrun->wav_file = open_file(argv[2], "wb+")) == NULL) return -1;
-		if (init_wav(rxrun->wav_file, 1) <= 0) { printf("File init failed\n"); return -1; }
-	} else if (!strcmp(argv[1], "play")) {
-		mode = MODE_PLAY;
-		if (argc < 3) {
-			printf("Specify file name\n");
-			return 1;
-		}
-		if ((txrun->wav_file = open_file(argv[2], "r")) == NULL) return -1;
-	} else if (!strcmp(argv[1], "playrec")) {
-		mode = MODE_PLAY_RECORD;
-		if (argc < 4) {
-			printf("usage: %s playrec [imp | sine | <play file>] <rec file>\n");
-			return 1;
-		}
-		if (!strcmp(argv[2], "imp")) { 
-			fixtype = FIX_IMPULSE; 
-			mode = MODE_PLAY_FIX_RECORD;
-		} else if (!strcmp(argv[2], "sine")) {
-			sinmult = 6;
-			fixtype = FIX_SINE;
-			mode = MODE_PLAY_FIX_RECORD;
-		} else {
-			if ((txrun->wav_file = open_file(argv[2], "r")) == NULL) return -1;
+	
+		if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD || mode == MODE_LMS_LEARN) {
+			if (rxrun->wav_file == NULL) {
+				if((rxrun->wav_file = open_file(record_filename, "wb+")) == NULL) return -1;
+				init_wav(rxrun->wav_file, 1);
+			}
 		}
 
-		if ((rxrun->wav_file = open_file(argv[3], "wb+")) == NULL) return -1;
-		if (init_wav(rxrun->wav_file, 1) <= 0) { printf("File init failed\n"); return -1; }
-	} else if (!strcmp(argv[1], "learn")) {
-		if (argc < 6) {
-			printf("usage: %s learn <play file> <rec file>\n");
+		if (mode == MODE_LMS_LEARN) {
+			if (buffer1 == NULL || buffer2 == NULL) {
+				buffer1 = open_file(reference_data, "wb+");
+				buffer2 = open_file(response_data, "wb+");
+			}
 		}
-
-		mode = MODE_LMS_LEARN;
-		target = lms_init(COEF_COUNT, 1000 * (BUFSIZE/4), MU); /* lms_init(tap, max, mu) */
-
-		if ((txrun->wav_file = open_file(argv[2], "r")) == NULL) return -1;
-		if ((rxrun->wav_file = open_file(argv[3], "wb+")) == NULL) return -1;
-		if (init_wav(rxrun->wav_file, 1) <= 0) { printf("File init failed\n"); return -1; }
-		if ((buffer1 = open_file(argv[4], "wb+")) == NULL) return -1;
-		if ((buffer2 = open_file(argv[5], "wb+")) == NULL) return -1;
 	}
 
-	if (mode == MODE_PLAY_FIX_RECORD) {
-		fix_data_generate(fixtype); 
-	}
+#ifdef I2S_MASTER
+	enable_i2s();
+#endif
 
 	/* Open coefficient file */
 	if((coeff = open_file("coef.txt", "r")) == NULL) return -1;
@@ -510,30 +595,21 @@ int main(int argc, char **argv)
 		i++;
 	}
 
-	for (i = 0; i < argc; i++) {
-		if (!strcmp(argv[i], "-n")) {
-			printf("No Filter Mode\n");
-			for(j = 0; j < COEF_COUNT; j++) {
-				filter_taps[j] = (j == 1) ? 0x800000 : 0;
-			} 
-		}
-		if (!strcmp(argv[i], "-v")) {
-			verbose = 1;
-		}
-		if (!strcmp(argv[i], "-d")) {
-			delaysize = atoi(argv[i+1]);
-			printf("delay: %d\n", delaysize);
-		}
+	if (nofilter) {
+		printf("No Filter Mode\n");
+		for(j = 0; j < COEF_COUNT; j++) {
+			filter_taps[j] = (j == 1) ? 0x800000 : 0;
+		} 
 	}
 
 	/* Allocate buffers */
 	if(map_buffers(rxrun, txrun) < 0) return -1;
 
 	/* Map coefficient buffer */
-	if (map_coef_buffer(&coefbuf) < 0) return -1;
+	if (map_coef_buffer(&coefbuf, modnum) < 0) return -1;
 
 	/* Open devices */
-	if(init_devices(rxrun, txrun) < 0) return -1;
+	if(init_devices(rxrun, txrun, modnum) < 0) return -1;
 
 	/* Begin */
 	init_mode(rxrun, txrun);
@@ -544,11 +620,8 @@ int main(int argc, char **argv)
 		//printf("%d\n", coefbuf[i]);
 	}
 
-	/* clear buffer */
-	for (i = 0; i < (BUFSIZE * BUFCOUNT)/4; i++) {
-		rxrun->buf[i] = 0;
-		txrun->buf[i] = 0;
-	}
+	memset(rxrun->buf, 0, (BUFSIZE * BUFCOUNT) / 4);
+	memset(txrun->buf, 0, (BUFSIZE * BUFCOUNT) / 4);
 
 	if (mode == MODE_NONE) goto finish;
 
@@ -560,7 +633,6 @@ int main(int argc, char **argv)
 				mode ==  MODE_PLAY_FIX_RECORD || 
 				mode == MODE_LMS_LEARN) {
 
-		/* use pthread */	
 		if (pthread_create(&record_thread_id, NULL, record_thread, (void *)rxrun)) {
 			fprintf(stderr, "Error creating thread\n");
 			return 1;
@@ -579,13 +651,20 @@ int main(int argc, char **argv)
 
 	if (mode == MODE_LMS_LEARN) {
 		fclose(coeff);
-		coeff = open_file("coef.txt", "w");
+		coeff = open_file("float_coef.txt", "w");
 		for (i = 0; i < COEF_COUNT; i++) {
-			fprintf(coeff, "%d\n", fl2fix26(target->h[i]));
-			//printf("%d\n", fl2fix26(target->h[i]));
+			//fprintf(coeff, "%d\n", fl2fix26(target->h[i]));
+			fprintf(coeff, "%.7g\n", target->h[i]);
 		}
+		FILE * icoeff = open_file("coef.txt", "w");
+		for (i = 0; i < COEF_COUNT; i++) {
+			fprintf(icoeff, "%d\n", fl2fix26(target->h[i]));
+			//fprintf(coeff, "%.7g\n", target->h[i]);
+		}
+		fclose(icoeff);
 		fclose(buffer1); fclose(buffer2);
 	}
+
 finish:
 	free(rxrun); free(txrun);
 	fclose(coeff);

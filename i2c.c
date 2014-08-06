@@ -5,16 +5,13 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 
-#define CLKCTRL_FRQ_1024 0x6
-#define CLKCTRL_SRC_PLL  0x8
-#define CLKCTRL_DISABLE  0x0
-
 #define CODEC3_I2C_CS 158
 #define CODEC2_I2C_CS 157
-#define CODEC1_I2C_CS
+#define CODEC1_I2C_CS 156
 #define I2C_CLEAR 999
 
 #define GPIO_PATH	 "/sys/class/gpio"
@@ -23,32 +20,13 @@
 
 static int verbose = 0;
 
-static int pll_read(int fd) {
-	int ret = 0;
-	uint8_t buf[8];
-	
-	ret = ioctl(fd, I2C_SLAVE, I2C_ADDRESS);
-	if (ret < 0) { printf("Wrong Address?\n"); close(fd); return ret; }
+#define enable_i2s(addr) addr = 0x1
+#define disable_i2s(addr) addr = 0x0
 
-	memset(buf, 0, 8);
-	buf[0] = 0x40;
-	buf[1] = 0x02;
-	
-	ret = read(fd, buf, 8);
-	if (ret < 0) { printf("Read failed, errno = %d\n", errno); }
-	else {
-		if (verbose) {
-				printf("Read ret: %d\n", ret);
-				printf("PLL: (%02x%02x) %02x%02x %02x%02x %02x%02x\n",
-						 buf[0], buf[1], buf[2], buf[3], 
-						 buf[4], buf[5], buf[6], buf[7]);
-		}
-	}
+int master = 0;
 
-	return ret;
-}
-
-static int write_command(int fd, uint8_t *cmd, int len, const char *name) {
+static int write_command(int fd, uint8_t *cmd, int len, const char *name) 
+{
 	int ret;
 
 	ret = ioctl(fd, I2C_SLAVE, I2C_ADDRESS);
@@ -63,7 +41,8 @@ static int write_command(int fd, uint8_t *cmd, int len, const char *name) {
 	return 0;
 }
 
-static void construct_cmd(uint8_t msb, uint8_t cmd, uint8_t *buf) {
+static void construct_cmd(uint8_t msb, uint8_t cmd, uint8_t *buf) 
+{
 	buf[0] = 0x40;
 	buf[1] = msb;
 	buf[2] = cmd;	
@@ -72,6 +51,7 @@ static void construct_cmd(uint8_t msb, uint8_t cmd, uint8_t *buf) {
 static void gpio_init(void) {
 	char path[60];
 	FILE* fd;
+	int i;
 
 	sprintf(path, "%s/export", GPIO_PATH);
 	fd = fopen(path, "w");
@@ -84,43 +64,33 @@ static void gpio_init(void) {
 	fprintf(fd, "%d\n", CODEC3_I2C_CS);
 	rewind(fd);
 	fprintf(fd, "%d\n", CODEC2_I2C_CS);
+	rewind(fd);
+	fprintf(fd, "%d\n", CODEC1_I2C_CS);
 
 	fclose(fd);
 
-	sprintf(path, "%s/gpio%d/direction", GPIO_PATH, CODEC3_I2C_CS);
-	
-	printf("opening %s..\n", path);
-	fd = fopen(path, "w");
-	if (!fd) {
-		printf("Can't open direction file for gpio%d\n", CODEC3_I2C_CS);
-		return;
+	for (i = CODEC3_I2C_CS; i >= CODEC1_I2C_CS; i--) {
+		sprintf(path, "%s/gpio%d/direction", GPIO_PATH, i);
+		
+		printf("opening %s..\n", path);
+		fd = fopen(path, "w");
+		if (!fd) {
+			printf("Can't open direction file for gpio%d\n", i);
+			return;
+		}
+
+		rewind(fd);
+		fprintf(fd, "out");
+		fclose(fd);
 	}
 
-	rewind(fd);
-	fprintf(fd, "out");
-
-	fclose(fd);
-
-	sprintf(path, "%s/gpio%d/direction", GPIO_PATH, CODEC2_I2C_CS);
-
-	printf("opening %s..\n", path);
-	fd = fopen(path, "w");
-	if (!fd) {
-		printf("Can't open direction file for gpio%d\n", CODEC2_I2C_CS);
-		return;
-	}
-
-	rewind(fd);
-	fprintf(fd, "out");
-
-	fclose(fd);
 }
 
-static void gpio_mux(int codec) {
+static void select_gpio(int codec, int select) {
 	char path[50];
 	FILE * fd;
 
-	sprintf(path, "%s/gpio%d/value", GPIO_PATH, CODEC2_I2C_CS);
+	sprintf(path, "%s/gpio%d/value", GPIO_PATH, codec);
 
 	if (access(path, F_OK) < 0) gpio_init();
 
@@ -130,95 +100,133 @@ static void gpio_mux(int codec) {
 		return;
 	}
 
-	printf("writing %d to %s\n", codec == CODEC2_I2C_CS ? 0 : 1, path);
+	printf("writing %d to %s\n", select, path);
 	rewind(fd);
-	if (codec == I2C_CLEAR) fprintf(fd, "0");
-	else fprintf(fd, "%d", codec == CODEC2_I2C_CS ? 0 : 1);
-
-	fclose(fd);
-
-	sprintf(path, "%s/gpio%d/value", GPIO_PATH, CODEC3_I2C_CS);
-
-	fd = fopen(path, "w");
-	if (!fd) {
-		gpio_init();
-		printf("Can't open %s\n", path);
-		if (!fd) return;
-	}
-
-	printf("writing %d to %s\n", codec == CODEC3_I2C_CS ? 0 : 1, path);
-	rewind(fd);
-	if (codec == I2C_CLEAR) fprintf(fd, "0");
-	else fprintf(fd, "%d", codec == CODEC3_I2C_CS ? 0 : 1);
+	fprintf(fd, "%d\n", select);
 
 	fclose(fd);
 }
 
+static void gpio_mux(int codec) {
+	switch(codec) {
+		case CODEC1_I2C_CS:
+			select_gpio(CODEC1_I2C_CS, 0);
+			select_gpio(CODEC2_I2C_CS, 1);
+			select_gpio(CODEC3_I2C_CS, 1);
+			break;
+		case CODEC2_I2C_CS:
+			select_gpio(CODEC1_I2C_CS, 1);
+			select_gpio(CODEC2_I2C_CS, 0);
+			select_gpio(CODEC3_I2C_CS, 1);
+			break;
+		case CODEC3_I2C_CS:
+			select_gpio(CODEC1_I2C_CS, 1);
+			select_gpio(CODEC2_I2C_CS, 1);
+			select_gpio(CODEC3_I2C_CS, 0);
+			break;
+		case I2C_CLEAR:
+			select_gpio(CODEC1_I2C_CS, 0);
+			select_gpio(CODEC2_I2C_CS, 0);
+			select_gpio(CODEC3_I2C_CS, 0);
+			break;
+		default:
+			break;
+	}
+}
+
 int main(int argc, char **argv) {
-	int fd, ret;
+	int fd, ret, fd2;
+	unsigned long *i2s_config;
 	uint8_t *buf;
 	uint8_t mx0, mx1;	
 	int val, i;
-	int mode = 1; //master
 
-	for (i = 0; i < argc; i++) {
-		if (!strcmp(argv[i], "-v")) verbose = 1;
-		if (!strcmp(argv[i], "-1")) {
-			gpio_mux(CODEC3_I2C_CS);
-		}
-		if (!strcmp(argv[i], "-2")) {
-			mode = 0; //slave
-			gpio_mux(CODEC2_I2C_CS);
-		}
-	}	
-
-	
 	fd = open("/dev/i2c-0", O_RDWR);
 	if (fd < 0) return 1;
 
 	buf = malloc(sizeof(uint8_t) * 8);
 	if (!buf) { printf("Malloc failed\n"); return -1; }
 
-	/* Set up PLL by first turning it off */
-	construct_cmd(0x00, 0x0E, buf);
-	if (write_command(fd, buf, 3, "SET UP PLL")) goto exit;
 
-	usleep(65000);
+	for (i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "-v")) verbose = 1;
+		if (!strcmp(argv[i], "-master")) master = 1;
+		if (!strcmp(argv[i], "-3")) {
+			gpio_mux(CODEC3_I2C_CS);
+		}
+		if (!strcmp(argv[i], "-2")) {
+			gpio_mux(CODEC2_I2C_CS);
+		}
+		if (!strcmp(argv[i], "-1")) {
+			gpio_mux(CODEC1_I2C_CS);
+		}
+		if (!strcmp(argv[i], "-turnoff")) {
+			construct_cmd(0x00, 0x00, buf);
+			write_command(fd, buf, 3, "TURN OFF PLL");
+		}
+	}	
 
-#if 1
-
-	/* Write configuration values */
-	uint8_t pllbuf[] = { 0x40, 0x02, 0x02, 0x71, 0x01, 0xDD, 0x19, 0x01 };
-	if (argc > 1 && !strcmp(argv[1], "48khz")) {
-		pllbuf[2] = 0x00; pllbuf[3] = 0x7D;
-		pllbuf[4] = 0x00; pllbuf[5] = 0x0C;
-		pllbuf[6] = 0x21; pllbuf[7] = 0x01;
+	fd2 = open("/dev/mem", O_RDWR);
+	if (!fd2) {
+		printf("Can't open /dev/mem\n");
+		return -1;
 	}
-	if (write_command(fd, pllbuf, 8, "WRITE PLL CMD")) goto exit;
+	
+	i2s_config = mmap(NULL, getpagesize(), PROT_WRITE | PROT_READ, MAP_SHARED,
+							fd2, 0xff250000);	
+	
+	if (i2s_config == MAP_FAILED) {
+		printf("Failed to map i2s_config\n");
+		return -1;
+	}
+	
+	
+	disable_i2s(i2s_config[4]);
+	
+	/* Set up PLL by first turning it off */
+	if (master)
+		construct_cmd(0x00, 0x0E, buf);
+	else
+		construct_cmd(0x00, 0x00, buf);
+	if (write_command(fd, buf, 3, "TURN OFF PLL")) goto exit;
 
-	/* wait */
 	usleep(65000);
+
+	if (master)  {
+		/* Write configuration values */
+		uint8_t pllbuf[] = { 0x40, 0x02, 0x02, 0x71, 0x01, 0xDD, 0x19, 0x01 };
+		if (argc > 1 && !strcmp(argv[1], "48khz")) {
+			pllbuf[2] = 0x00; pllbuf[3] = 0x7D;
+			pllbuf[4] = 0x00; pllbuf[5] = 0x0C;
+			pllbuf[6] = 0x21; pllbuf[7] = 0x01;
+		}
+		if (write_command(fd, pllbuf, 8, "WRITE PLL CMD")) goto exit;
+
+		/* wait */
+		usleep(65000);
+	}
 
 	/* Enable the core */
-	construct_cmd(0x00, 0x0F, buf);
+	if (master) 
+		construct_cmd(0x00, 0x0F, buf);
+	else
+		construct_cmd(0x00, 0x01, buf);
+
 	if (write_command(fd, buf, 3, "ENABLE CORE")) goto exit;
 
-#if 0
 	construct_cmd(0x2F, 0xA0, buf);
 	if (write_command(fd, buf, 3, "CONTROL PAD CONTROL 0")) goto exit;
 
 	construct_cmd(0x30, 0x01, buf);
 	if (write_command(fd, buf, 3, "CONTROL PAD CONTROL 1")) goto exit;
-#endif
 
-	if (mode) {
-		/* Become I2S Master */
+	/* Became I2S master */
+
+	if (master)
 		construct_cmd(0x15, 0x01, buf);
-		if (write_command(fd, buf, 3, "BECOME I2S MASTER")) goto exit;
-	} else {
+	else 
 		construct_cmd(0x15, 0x00, buf);
-		if (write_command(fd, buf, 3, "BECOME I2S SLAVE")) goto exit;
-	}
+	if (write_command(fd, buf, 3, "BECOME I2S SLAVE")) goto exit;
 
 	/* Setting input mixers */
 	/* Enable left mixer */
@@ -257,24 +265,22 @@ int main(int argc, char **argv) {
    /*			                                  |-> to playback */
 	/* LDVOL Control (Differential Control) */
 	/* LDVOL[5:0] | LDMUTE | LDEN */
-	val = (0x3F << 2) | (1 << 1) | 1;
+	val = (0x25 << 2) | (1 << 1) | 1;
 	construct_cmd(0x0E, val, buf);
 	if (write_command(fd, buf, 3, "LEFT DIFF INPUT VOL CONTROL")) goto exit;
 
-//#define ALC
+#define ALC
 #ifdef ALC
 	/* PGASLEW[1:0] | ALCMAX[2:0] | ALCSEL[2:0] */
 	/* ALCSEL : 000 => off, 001 => Right, 010 => Left, 011 => Stereo */
-	val = (0 << 6) | (2 << 3) | (3 << 0);
+	val = (0 << 6) | (2 << 3) | (0 << 0);
 	construct_cmd(0x11, val, buf);
 	if (write_command(fd, buf, 3, "LEFT DIFF INPUT ALC")) goto exit;
 
 	/* NGTYP[1:0] | NGEN | NGTHR[4:0] */
-	val = (3 << 6) | (1 << 5) | (0x08); 
+	val = (3 << 6) | (0 << 5) | (0x00); 
 	construct_cmd(0x14, val, buf);
 	if (write_command(fd, buf, 3, "ALC NOISE GATE")) goto exit;
-#endif
-
 #endif
 
 	/* Setting up output mixers */
@@ -319,46 +325,38 @@ int main(int argc, char **argv) {
 	construct_cmd(0x20, val, buf);
 	if (write_command(fd, buf, 3, "PLAYBACK MX5G3 ENABLE")) goto exit;
 	
-#if 0
-	/* Left Headphone Volume */
-	construct_cmd(0x23, 0xFE, buf);
-	if (write_command(fd, buf, 3, "ENABLE HP VOLUME LEFT")) goto exit;
-
-	/* Right Headphone Volume */
-	construct_cmd(0x24, 0xFE, buf);
-	if (write_command(fd, buf, 3, "ENABLE HP VOLUME RIGHT")) goto exit;
-
-#endif
 	/* Left Line Out Volume */
 	/* this make difference */
-	construct_cmd(0x25, 0xFE, buf);
+	construct_cmd(0x25, 0xCE, buf);
 	if (write_command(fd, buf, 3, "ENABLE LINEOUT VOLUME LEFT")) goto exit;
 	
 	/* Set Up ADC */
-	construct_cmd(0x19, 0x03, buf);
+	/* Invert polarity (it comes from LINN) */
+	/* HPF enabled */
+	construct_cmd(0x19, 0x61, buf);
 	if (write_command(fd, buf, 3, "ADC ENABLE (BOTH)")) goto exit;
 
 	/* Enable DAC */
 	construct_cmd(0x2a, 0x01, buf);
 	if (write_command(fd, buf, 3, "dac enable (both)")) goto exit;
 
-
-#if 1
 	/* Converter */
 	/* 0 | DAPAIR[1:0] | DAOSR | ADOSR | CONVSR[2:0] */
-	val =  (0 << 5) | (0 << 4) | (0 << 3) | 0;
+	val =  (0 << 5) | (0 << 4) | (0 << 3) | 6;
 	construct_cmd(0x17, val, buf);
 	if (write_command(fd, buf, 3, "Converter")) goto exit;
 
-
 	/* Serial Control 1 */
 	/* BPF[2:0] | ADTDM | DATDM | MSBP | LRDEL[1:0] */
-	//val = 0;
 	val = (0 << 5) | (0 << 4) | (0 << 3) | (1 << 2) | 0;
+	for (i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "-msb")) {
+			val = (0 << 5) | (0 << 4) | (0 << 3) | (0 << 2) | 0;
+		}
+	}
 	construct_cmd(0x16, val, buf);
 	if (write_command(fd, buf, 3, "Serial Control 1")) goto exit;
 
-#endif
 
 	/* Set up record management */
 	construct_cmd(0x09, 0x2A << 1, buf);
@@ -375,9 +373,18 @@ int main(int argc, char **argv) {
 	construct_cmd(0x29, 0x03, buf);
 	if (write_command(fd, buf, 3, "PLAYBACK POWER ON")) goto exit;
 	
+
+	if (!master) {
+		construct_cmd(0x2D, 0xA8, buf);
+		if (write_command(fd, buf, 3, "BCLK PULL-UP ON")) goto exit;
+
+		/* Dejitter control */
+		construct_cmd(0x36, 0x05, buf);
+		if (write_command(fd, buf, 3, "DEJITTER CONTROL")) goto exit;
+	}
+
+
 #if 0
-	construct_cmd(0x2D, 0xBA, buf);
-	if (write_command(fd, buf, 3, "DAC_DATA PULL DOWN")) goto exit;
 
 	/* Setup signal routing */
 	/* Serial input */
@@ -393,7 +400,11 @@ int main(int argc, char **argv) {
 
 exit:
 	gpio_mux(I2C_CLEAR);
+	enable_i2s(i2s_config[4]);
 
+	munmap(i2s_config, getpagesize());
+
+	close(fd2);
 	close(fd);
 	return 0;
 }
