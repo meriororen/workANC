@@ -353,16 +353,18 @@ void *record_loop(void *runtime)
 
 	if (!rx->enable || rx->modnum != modnum) goto _exit;
 
+	/* synchronize with other threads */
+	pthread_mutex_lock(&start_mutex);
 	rx->filesize = 0;
-	while (stop_all_threads == 0) {
-		pthread_mutex_lock(&start_mutex);
-		unstarted--;
-		while (unstarted > 0) {
-			pthread_mutex_unlock(&start_mutex);
-			usleep(10);
-			pthread_mutex_lock(&start_mutex);
-		}
+	unstarted--;
+	while (unstarted > 0) {
 		pthread_mutex_unlock(&start_mutex);
+		usleep(1);
+		pthread_mutex_lock(&start_mutex);
+	}
+	pthread_mutex_unlock(&start_mutex);
+
+	while (stop_all_threads == 0) {
 		if (!record_next_period(rx)) continue;
 
 		pfd.fd = rx->fd;
@@ -385,6 +387,7 @@ void *record_loop(void *runtime)
 			}
 
 			lms_complete(target);
+			printf("Learn Complete\n");
 			stop_all_threads = 1;
 		}
 
@@ -399,7 +402,7 @@ void *record_loop(void *runtime)
 	}
 
 _exit:
-	printf("RX Thread #%d exited\n", rx->modnum);
+	//printf("RX Thread #%d exited\n", rx->modnum);
 	pthread_exit(NULL);
 }
 
@@ -412,19 +415,19 @@ void *play_loop(void *runtime)
 	
 	if (!tx->enable || tx->modnum != modnum) goto _exit;
 
+	/* synchronize with other threads */
 	pthread_mutex_lock(&start_mutex);
-
 	tx->count = 0;
 	set_period(tx);
 	unstarted--;
-	while (stop_all_threads == 0) {
-		while (unstarted > 0) {
-			pthread_mutex_unlock(&start_mutex);
-			usleep(10);
-			pthread_mutex_lock(&start_mutex);
-		}
+	while (unstarted > 0) {
 		pthread_mutex_unlock(&start_mutex);
+		usleep(1);
+		pthread_mutex_lock(&start_mutex);
+	}
+	pthread_mutex_unlock(&start_mutex);
 
+	while (stop_all_threads == 0) {
 		if (!play_next_period(tx, 0)) continue;
 	
 		pfd.fd = tx->fd;
@@ -447,7 +450,7 @@ void *play_loop(void *runtime)
 	} 
 
 _exit:
-	printf("TX Thread #%d exited\n", tx->modnum);
+	//printf("TX Thread #%d exited\n", tx->modnum);
 	pthread_exit(NULL);
 }
 
@@ -650,7 +653,7 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 
 	while (1) {
-		usleep(10);
+		usleep(1);
 		if (signal_received == SIGINT) {
 			stop_all_threads = 1; 
 			break;

@@ -115,7 +115,8 @@ static inline int fl2fix(double s)
 
 static inline int fl2fix26(double s)
 {
-	return (int) ceil(s * (0x00000000003ffffF + 0.5));
+	//return (int) ceil(s * (0x00000000007fffffF + 0.5));
+	return (int) ceil(s * ((double ) pow(2, 21) + 0.5));
 }
 
 static FILE * open_file(const char *filename, const char *mode) 
