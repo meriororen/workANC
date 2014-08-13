@@ -84,6 +84,7 @@ typedef enum {
 	MODE_REALTIME,
 	MODE_LMS_LEARN,
 	MODE_EQUAL_FILTER,
+	MODE_ANC,
 } audio_mode_t;
 
 typedef enum {
@@ -94,8 +95,16 @@ typedef enum {
 	EQ_FINISH,
 } eq_state_t;
 
+typedef enum {
+	ANC_IDLE,
+	ANC_CALIBRATE_DELAY,
+	ANC_START,
+	ANC_FINISH,
+} anc_state_t;
+
 static audio_mode_t mode = MODE_NONE;
 static eq_state_t eq_stat = EQ_IDLE;
+static anc_state_t anc_stat = ANC_IDLE;
 
 #define FIX_SINE 1
 #define FIX_IMPULSE 2
@@ -116,7 +125,7 @@ static inline int fl2fix(double s)
 static inline int fl2fix26(double s)
 {
 	//return (int) ceil(s * (0x00000000007fffffF + 0.5));
-	return (int) ceil(s * ((double ) pow(2, 21) + 0.5));
+	return (int) ceil(s * ((double ) pow(2, 22) + 0.5));
 }
 
 static FILE * open_file(const char *filename, const char *mode) 
@@ -164,7 +173,7 @@ static void finalize_wav(FILE *file, int filesize)
 		filesize -= 4;
 		if (filesize < 0) return;
 
-		printf("size: %d\n", filesize);
+		//printf("size: %d\n", filesize);
 		fseek(file, 0x4, SEEK_SET);
 		fwrite(&filesize, 4, 1, file);
 		filesize += 0x24; // header size
@@ -189,11 +198,15 @@ static void init_mode(struct runtime *rx, struct runtime *tx, int modnum)
 		case MODE_PLAY_RECORD:
 		case MODE_PLAY_FIX_RECORD:
 		case MODE_LMS_LEARN:
+		case MODE_EQUAL_FILTER:
 			if (modnum == tx->modnum) {
 				tx->enable = 1;
 				rx->enable = 1;
 			}
 			break;
+		case MODE_ANC:
+			if (tx->modnum == 2) tx->enable = 1;
+			rx->enable = 1;
 		default:
 			break;
 	}
@@ -214,7 +227,7 @@ static void init_module(struct runtime *rx, struct runtime *tx, int modnum)
 	tx->modnum = modnum;
 }
 
-#define launch_thread(th_id, loop, run) \
+#define launch_thread_sync(th_id, loop, run) \
 	if (run->enable) {\
 		pthread_create(&th_id, NULL, loop, (void *)run); \
 		unstarted++; \
