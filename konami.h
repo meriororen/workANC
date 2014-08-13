@@ -1,28 +1,21 @@
 #ifndef ANC_KONAMI_H
 #define ANC_KONAMI_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
 #include <stdint.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <asm/ioctl.h>
-#include <poll.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
-#include <arpa/inet.h>
 
 #include <pthread.h>
 
-//#include "lms.h"
 #include "orz_lms.h"
+
+#define MODULENUM 2
 
 #define PAGE_SIZE 0x1000
 
@@ -32,10 +25,12 @@
 
 #define RX_BASE 	0xC0000000
 #define TX_BASE 	0xD0000000
+#define RX_BASE2  0xC1000000
+#define TX_BASE2  0xD1000000
 
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
-#define BUFSIZE 	CHANNELS * 55 * WORDSIZE 
-#define BUFCOUNT 8
+#define BUFSIZE CHANNELS * 55 * WORDSIZE 
+#define BUFCOUNT 1
 
 /* ioctl definition */
 #define KONAMI_MAGIC 0xBA
@@ -53,12 +48,8 @@
 #define AMPLITUDE (pow(2, SAMPLE_BIT- 1))
 
 /* FIR Coefficient */
-#define COEF_BASE 0xFF241000
-#define COEF_COUNT 63
-
-/* Ping-pong buffer for delay */
-#define MAX_DELAY 1024
-#define DELAYSIZE 6992
+#define COEF_COUNT 64
+#define I2S_BASE 0xFF240000
 
 /* Sign extend */
 #define sext(x) (x & 0x800000 ? x | 0xFF000000 : x & 0x00FFFFFF)
@@ -71,13 +62,16 @@ struct descriptor {
 };
 
 struct runtime {
-	unsigned long current;
-	unsigned long *buf;
 	int fd;
+	int modnum;
 	int count;
 	int enable;
 	FILE *wav_file;
+	unsigned long current;
+	unsigned long *buf;
 	unsigned int filesize; /* for rx only */
+	unsigned int delaycount;
+	unsigned long base;
 };
 
 typedef enum {
@@ -89,21 +83,24 @@ typedef enum {
 	MODE_RECORD,
 	MODE_REALTIME,
 	MODE_LMS_LEARN,
+	MODE_EQUAL_FILTER,
 } audio_mode_t;
 
-#define FIX_SINE 0
-#define FIX_IMPULSE 1
+typedef enum {
+	EQ_IDLE,
+	EQ_START,
+	EQ_CALIBRATE_DELAY,
+	EQ_LMS_LEARN,
+	EQ_FINISH,
+} eq_state_t;
 
-extern audio_mode_t mode;
-extern int fixtype;
-extern int delaysize;
+static audio_mode_t mode = MODE_NONE;
+static eq_state_t eq_stat = EQ_IDLE;
 
-lms_t *target;
-FILE *buffer1;
-FILE *buffer2;
+#define FIX_SINE 1
+#define FIX_IMPULSE 2
 
-void record_loop(struct runtime *rxrun, struct runtime *txrun);
-void play_loop(struct runtime *tx);
+int calc_filter_lsq(double *impulse, double *result);
 
 static inline double fix2fl(int s) 
 {
@@ -118,8 +115,7 @@ static inline int fl2fix(double s)
 
 static inline int fl2fix26(double s)
 {
-	return (int) ceil(s * (0x00000000007ffffF + 0.5));
-	//return (int) ceil(s * (0x0000000001fffffF + 0.5));
+	return (int) ceil(s * (0x00000000003ffffF + 0.5));
 }
 
 static FILE * open_file(const char *filename, const char *mode) 
@@ -127,7 +123,7 @@ static FILE * open_file(const char *filename, const char *mode)
 	FILE *file;
 	file = fopen(filename, mode);
 	if (!file) {
-		printf("Can't open \"%s\"\n", filename);
+		printf("Cannot open \"%s\"\n", filename);
 		return NULL;
 	}
 	
@@ -175,33 +171,56 @@ static void finalize_wav(FILE *file, int filesize)
 		fwrite(&filesize, 4, 1, file);
 }
 
-static void init_mode(struct runtime *rxrun, struct runtime *txrun)
+static void init_mode(struct runtime *rx, struct runtime *tx, int modnum)
 {
+	tx->enable = 0;
+	rx->enable = 0;
+
 	switch (mode) {
 		case MODE_PLAY:
 		case MODE_PLAY_FIX:
-			txrun->enable = 1;
+			if (modnum == tx->modnum) tx->enable = 1;
 			break;
 		case MODE_RECORD:
 		case MODE_REALTIME:
-			rxrun->enable = 1;
+			if (modnum == rx->modnum) rx->enable = 1;
 			break;
 		case MODE_PLAY_RECORD:
 		case MODE_PLAY_FIX_RECORD:
 		case MODE_LMS_LEARN:
-			txrun->enable = 1;
-			rxrun->enable = 1;
+			if (modnum == tx->modnum) {
+				tx->enable = 1;
+				rx->enable = 1;
+			}
 			break;
 		default:
-			rxrun->enable = 0;
-			txrun->enable = 0;
 			break;
 	}
 
-	rxrun->current = RX_BASE; 
-	txrun->current = TX_BASE; 
-	rxrun->count = 0;
-	txrun->count = 0;	
+	rx->count = 0;
+	tx->count = 0;	
 }
+
+static void init_module(struct runtime *rx, struct runtime *tx, int modnum) 
+{
+	rx->wav_file = NULL; 
+	tx->wav_file = NULL; 
+	rx->base = (modnum == 1) ? RX_BASE : RX_BASE2; 
+	tx->base = (modnum == 1) ? TX_BASE : TX_BASE2; 
+	rx->current = rx->base; 
+	tx->current = tx->base;
+	rx->modnum = modnum; 
+	tx->modnum = modnum;
+}
+
+#define launch_thread(th_id, loop, run) \
+	if (run->enable) {\
+		pthread_create(&th_id, NULL, loop, (void *)run); \
+		unstarted++; \
+	}
+
+#define join_thread(th_id, run) \
+	if (run->enable) \
+		pthread_join(th_id, NULL)
 
 #endif

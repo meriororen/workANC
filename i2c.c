@@ -20,9 +20,6 @@
 
 static int verbose = 0;
 
-#define enable_i2s(addr) addr = 0x1
-#define disable_i2s(addr) addr = 0x0
-
 int master = 0;
 
 static int write_command(int fd, uint8_t *cmd, int len, const char *name) 
@@ -134,9 +131,39 @@ static void gpio_mux(int codec) {
 	}
 }
 
+static void i2s_disable(int mnum) {
+	int fd;
+	unsigned long base;
+	unsigned long *addr;
+
+	if (mnum = 1) {
+		base = 0xff240000;
+	} else {
+		base = 0xff250000;
+	}
+
+	fd = open("/dev/mem", O_RDWR);
+
+	if (!fd) {
+		printf("Can't open /dev/mem\n");
+		return;
+	}
+	
+	addr = mmap(NULL, getpagesize(), PROT_WRITE | PROT_READ, MAP_SHARED,
+							fd, base);	
+	
+	if (addr == MAP_FAILED) {
+		printf("Failed to map address\n");
+		return;
+	}
+
+	// disable
+	addr[4] = 0x0;
+}
+
 int main(int argc, char **argv) {
-	int fd, ret, fd2;
-	unsigned long *i2s_config;
+	int fd, ret, m1cfgd, m2cfgd;
+	unsigned long *m1cfg, *m2cfg;
 	uint8_t *buf;
 	uint8_t mx0, mx1;	
 	int val, i;
@@ -153,12 +180,14 @@ int main(int argc, char **argv) {
 		if (!strcmp(argv[i], "-master")) master = 1;
 		if (!strcmp(argv[i], "-3")) {
 			gpio_mux(CODEC3_I2C_CS);
+			i2s_disable(2);
 		}
 		if (!strcmp(argv[i], "-2")) {
 			gpio_mux(CODEC2_I2C_CS);
 		}
 		if (!strcmp(argv[i], "-1")) {
 			gpio_mux(CODEC1_I2C_CS);
+			i2s_disable(1);
 		}
 		if (!strcmp(argv[i], "-turnoff")) {
 			construct_cmd(0x00, 0x00, buf);
@@ -166,52 +195,26 @@ int main(int argc, char **argv) {
 		}
 	}	
 
-	fd2 = open("/dev/mem", O_RDWR);
-	if (!fd2) {
-		printf("Can't open /dev/mem\n");
-		return -1;
-	}
-	
-	i2s_config = mmap(NULL, getpagesize(), PROT_WRITE | PROT_READ, MAP_SHARED,
-							fd2, 0xff250000);	
-	
-	if (i2s_config == MAP_FAILED) {
-		printf("Failed to map i2s_config\n");
-		return -1;
-	}
-	
-	
-	disable_i2s(i2s_config[4]);
-	
 	/* Set up PLL by first turning it off */
-	if (master)
-		construct_cmd(0x00, 0x0E, buf);
-	else
-		construct_cmd(0x00, 0x00, buf);
+	construct_cmd(0x00, 0x0E, buf);
 	if (write_command(fd, buf, 3, "TURN OFF PLL")) goto exit;
 
 	usleep(65000);
 
-	if (master)  {
-		/* Write configuration values */
-		uint8_t pllbuf[] = { 0x40, 0x02, 0x02, 0x71, 0x01, 0xDD, 0x19, 0x01 };
-		if (argc > 1 && !strcmp(argv[1], "48khz")) {
-			pllbuf[2] = 0x00; pllbuf[3] = 0x7D;
-			pllbuf[4] = 0x00; pllbuf[5] = 0x0C;
-			pllbuf[6] = 0x21; pllbuf[7] = 0x01;
-		}
-		if (write_command(fd, pllbuf, 8, "WRITE PLL CMD")) goto exit;
-
-		/* wait */
-		usleep(65000);
+	/* Write configuration values */
+	uint8_t pllbuf[] = { 0x40, 0x02, 0x02, 0x71, 0x01, 0xDD, 0x19, 0x01 };
+	if (argc > 1 && !strcmp(argv[1], "48khz")) {
+		pllbuf[2] = 0x00; pllbuf[3] = 0x7D;
+		pllbuf[4] = 0x00; pllbuf[5] = 0x0C;
+		pllbuf[6] = 0x21; pllbuf[7] = 0x01;
 	}
+	if (write_command(fd, pllbuf, 8, "WRITE PLL CMD")) goto exit;
+
+	/* wait */
+	usleep(65000);
 
 	/* Enable the core */
-	if (master) 
-		construct_cmd(0x00, 0x0F, buf);
-	else
-		construct_cmd(0x00, 0x01, buf);
-
+	construct_cmd(0x00, 0x0F, buf);
 	if (write_command(fd, buf, 3, "ENABLE CORE")) goto exit;
 
 	construct_cmd(0x2F, 0xA0, buf);
@@ -234,10 +237,10 @@ int main(int argc, char **argv) {
 	if (write_command(fd, buf, 3, "ENABLE RECORD MIXER LEFT")) goto exit;
 	
 	/* Digital volume (AD) Attenuator (Negative dB) */
-	construct_cmd(0x1A, 0x00, buf);
+	construct_cmd(0x1A, 0x10, buf);
 	if (write_command(fd, buf, 3, "DIGITAL VOLUME (LADVOL)")) goto exit;
 	
-	val = 0;
+	val = 10;
 	for (i = 0; i < argc; i++) {
 		if (!strcmp(argv[i], "davol")) {
 			int vol = atoi(argv[i+1]);
@@ -253,7 +256,7 @@ int main(int argc, char **argv) {
 #define PGA
 #ifdef PGA
 	/*	LDBOOST = 0dB */
-	if (argc > 1 && !strcmp(argv[1], "0dB")) {
+	if (argc > 1 && !strcmp(argv[1], "boost")) {
 		val = 0x08;
 	} else {
 		val = 0x10;
@@ -327,7 +330,7 @@ int main(int argc, char **argv) {
 	
 	/* Left Line Out Volume */
 	/* this make difference */
-	construct_cmd(0x25, 0xCE, buf);
+	construct_cmd(0x25, 0xFE, buf);
 	if (write_command(fd, buf, 3, "ENABLE LINEOUT VOLUME LEFT")) goto exit;
 	
 	/* Set Up ADC */
@@ -342,7 +345,7 @@ int main(int argc, char **argv) {
 
 	/* Converter */
 	/* 0 | DAPAIR[1:0] | DAOSR | ADOSR | CONVSR[2:0] */
-	val =  (0 << 5) | (0 << 4) | (0 << 3) | 6;
+	val =  (0 << 5) | (0 << 4) | (0 << 3) | 0;
 	construct_cmd(0x17, val, buf);
 	if (write_command(fd, buf, 3, "Converter")) goto exit;
 
@@ -400,11 +403,7 @@ int main(int argc, char **argv) {
 
 exit:
 	gpio_mux(I2C_CLEAR);
-	enable_i2s(i2s_config[4]);
 
-	munmap(i2s_config, getpagesize());
-
-	close(fd2);
 	close(fd);
 	return 0;
 }

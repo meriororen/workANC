@@ -1,9 +1,11 @@
 #include "konami.h"
 
+/* this code needs fpu enabled (-mfpu=vfpv3) */
+
 #define TAP COEF_COUNT
 #define NB TAP		// desired tapsize
 #define NG NB		// invert tapsize
-#define M_D NG/2
+#define M_D NG/2  // emulate delay (as many as half the tap #)
 
 void Gauss_invert(double a[NG][NG], double b[NG][NG], int n);
 
