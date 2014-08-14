@@ -48,7 +48,7 @@
 #define AMPLITUDE (pow(2, SAMPLE_BIT- 1))
 
 /* FIR Coefficient */
-#define COEF_COUNT 64
+#define COEF_COUNT 32
 #define I2S_BASE 0xFF240000
 
 /* Sign extend */
@@ -98,7 +98,7 @@ typedef enum {
 typedef enum {
 	ANC_IDLE,
 	ANC_CALIBRATE_DELAY,
-	ANC_START,
+	ANC_CANCELLATION,
 	ANC_FINISH,
 } anc_state_t;
 

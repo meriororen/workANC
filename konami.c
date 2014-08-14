@@ -9,15 +9,14 @@
 
 #define IMP_INTERVAL 40
 #define IMP_DATA 0x7fffff
-#define CALIBUFSIZE 512
-#define LMS_MAX_DATA 40000
+#define CALIBUFSIZE 256
+#define LMS_MAX_DATA 90000
 
 static int sinmult;
 static int filter_taps[COEF_COUNT];
 static int fix_samples[BUFSIZE/4]; 
 static int fixtype = 0;
 static int delaysize = 0;
-static int delaycount;
 static int interval = 0;
 static int samplecount = 0;
 static int stop_all_threads = 0;
@@ -237,29 +236,59 @@ int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
 	}
 }
 
-static
-int calibrate_delay(long dat, int left) 
-{
-	int delay = 0;
-	int j;
+#define DTHRSHOLD 0x400000 //(0.5) * (2^23)
+#define DTHRSHOLD2 0x66666 //(0.05) * (2^23)
 
-	if (calibc1 < CALIBUFSIZE) {
-		if (left) calibuf1[calibc1++] = sext(dat);
-	} else {
-		for(j = 0; j < CALIBUFSIZE; j++) {
-			int e = calibuf1[j] - calibuf1[j-1];
-			//printf("%d : %d [%d] %d\n", calibuf0[j], calibuf1[j], j, e);
-			if (calibuf0[j] == 0x7fffff) delay = 0;
-			if (e > 0x300000) { 
-				printf("delay = %d\n", delay);
-				return delay;
-			}
-			delay++;
+static
+int calibrate_delay(void)
+{
+	int j;
+	int delay;
+
+	for(j = 0; j < CALIBUFSIZE; j++) {
+		int e = calibuf1[j] - calibuf1[j-1];
+		//printf("%d : %d [%d] %d\n", calibuf0[j], calibuf1[j], j, e);
+		if (calibuf0[j] == IMP_DATA) delay = 0;
+		if (e > DTHRSHOLD) { 
+			printf("delay = %d\n", delay);
+			return delay;
 		}
+		delay++;
 	}
 
-	/* should not reach here */
 	return 0;
+}
+
+
+static 
+int calibrate_delay2(void)
+{
+	int j;
+	int delay1, delay2;
+	
+	for (j = 0; j < CALIBUFSIZE; j++) {
+		int d1 = calibuf1[j] - calibuf1[j-1];
+		if (calibuf0[j] == IMP_DATA) delay1 = 0;
+		if (d1 > DTHRSHOLD) {
+			printf("delay1 = %d\n", delay1);
+			break;
+		}
+		delay1++;
+	}
+
+	for (j = 0; j < CALIBUFSIZE; j++) {
+		int d2 = calibuf2[j] - calibuf2[j-1];
+		if (calibuf0[j] == IMP_DATA) delay2 = 0;
+		if (d2 > DTHRSHOLD2) {
+			printf("delay2 = %d\n", delay2);
+			break;
+		}
+		delay2++;
+	}
+
+	printf("delay2 - delay1 = %d\n", delay2 - delay1);
+
+	return delay2 - delay1;
 }
 
 /* Receive one period (1 full buffer) */
@@ -287,8 +316,10 @@ void receive_period(struct runtime *rx)
 				break;
 			case MODE_PLAY_RECORD:
 			case MODE_PLAY_FIX_RECORD:
-				if (do_calibration) {
-					if (calibrate_delay(x, left) > 0) {
+				if (calibc1 < CALIBUFSIZE) {
+					if (left) calibuf1[calibc1++] = sext(x);
+				} else {
+					if ((delaysize = calibrate_delay()) > 0) {
 						stop_all_threads = 1;
 						return;
 					}
@@ -299,9 +330,13 @@ void receive_period(struct runtime *rx)
 			case MODE_EQUAL_FILTER:
 				switch (eq_stat) {
 					case EQ_CALIBRATE_DELAY:
-						if ((delaysize = calibrate_delay(x, left)) > 0) {
-							stop_all_threads = 1;
-							return;
+						if (calibc1 < CALIBUFSIZE) {
+							if (left) calibuf1[calibc1++] = sext(x);
+						} else {
+							if ((delaysize = calibrate_delay()) > 0) {
+								stop_all_threads = 1;
+								return;
+							}
 						}
 						break;
 					case EQ_LMS_LEARN:
@@ -314,11 +349,22 @@ void receive_period(struct runtime *rx)
 				}
 				break;
 			case MODE_ANC:
-				if (anc_stat == ANC_CALIBRATE_DELAY) {
-					if (calibc1 < CALIBUFSIZE && rx->modnum == 2)
-						if (left) calibuf1[calibc1++] = sext(x);
-					if (calibc2 < CALIBUFSIZE && rx->modnum == 1)
-						if (left) calibuf2[calibc2++] = sext(x);
+				switch (anc_stat) {
+					case ANC_CALIBRATE_DELAY:
+						if (calibc1 < CALIBUFSIZE && rx->modnum == 2)
+							if (left) calibuf1[calibc1++] = sext(x);
+						if (calibc2 < CALIBUFSIZE && rx->modnum == 1)
+							if (left) calibuf2[calibc2++] = sext(x);
+
+						if (calibc1 >= CALIBUFSIZE && calibc2 >= CALIBUFSIZE &&
+							 rx->modnum == 2) {
+							delaysize = calibrate_delay2();
+							stop_all_threads = 1;
+							return;
+						}
+						break;
+					default:
+						break;
 				}
 				break;
 			default:
@@ -727,6 +773,7 @@ int main(int argc, char **argv)
 	enable_i2s(1);
 	enable_i2s(2);
 
+	delaysize = 0;
 	/* Main Loop */
 	int exit_loop = 0; 
 	while (1) {
@@ -764,6 +811,16 @@ int main(int argc, char **argv)
 
 		if (mode == MODE_ANC) {
 			switch (anc_stat) {
+				case ANC_CALIBRATE_DELAY:
+					printf("ANC delay finished\n");
+					exit_loop = 1;
+					break;
+				case ANC_CANCELLATION:
+					break;
+				case ANC_FINISH:
+					break;
+				default:
+					break;
 			}
 		} else if (mode == MODE_EQUAL_FILTER) {
 			switch (eq_stat) {
@@ -774,7 +831,7 @@ int main(int argc, char **argv)
 					eq_stat = EQ_LMS_LEARN;
 					if (txrun->enable) close_files(txrun, rxrun);
 					if (txrun2->enable) close_files(txrun2, rxrun2);
-					delaysize -= 6; // a little calibration
+					delaysize -= 2; // a little calibration
 					sleep(1);
 					break;
 				case EQ_LMS_LEARN:
@@ -816,7 +873,7 @@ int main(int argc, char **argv)
 		for(i = 0; i < CALIBUFSIZE; i++) {
 			fwrite(&calibuf0[i], sizeof(long), 1, reff);
 			fwrite(&calibuf1[i], sizeof(long), 1, resf);
-			if (mode == MODE_ANC) fwrite(&calibuf2[i], sizeof(long), 1, resf2);
+			fwrite(&calibuf2[i], sizeof(long), 1, resf2);
 		}
 	}
 
@@ -824,6 +881,12 @@ int main(int argc, char **argv)
 		finalize_wav(rxrun->wav_file, rxrun->filesize);
 		finalize_wav(rxrun2->wav_file, rxrun2->filesize);
 	}
+
+	/* Flush the last remaining RX & TX buffer */
+	record_next_period(rxrun);
+	record_next_period(rxrun);
+	play_next_period(txrun, 0);
+	play_next_period(txrun2, 0);
 
 	close_files(txrun, rxrun);
 	close_files(txrun2, rxrun2);
