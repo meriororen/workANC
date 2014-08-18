@@ -30,7 +30,7 @@
 
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
 #define BUFSIZE CHANNELS * 55 * WORDSIZE 
-#define BUFCOUNT 1
+#define BUFCOUNT 4
 
 /* ioctl definition */
 #define KONAMI_MAGIC 0xBA
@@ -48,7 +48,7 @@
 #define AMPLITUDE (pow(2, SAMPLE_BIT- 1))
 
 /* FIR Coefficient */
-#define COEF_COUNT 32
+#define COEF_COUNT 64
 #define I2S_BASE 0xFF240000
 
 /* Sign extend */
@@ -92,7 +92,7 @@ typedef enum {
 	EQ_START,
 	EQ_CALIBRATE_DELAY,
 	EQ_LMS_LEARN,
-	EQ_FINISH,
+	EQ_TEST,
 } eq_state_t;
 
 typedef enum {
@@ -122,9 +122,9 @@ static inline int fl2fix(double s)
 	return (int) ceil(s * (0x00000000007fffffF + 0.5));
 }
 
-static inline int fl2fix26(double s)
+static inline int fl2fix24(double s)
 {
-	//return (int) ceil(s * (0x00000000007fffffF + 0.5));
+	//return (int) ceil(s * (0x00000000007ffffF + 0.5));
 	return (int) ceil(s * ((double ) pow(2, 22) + 0.5));
 }
 

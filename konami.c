@@ -9,8 +9,8 @@
 
 #define IMP_INTERVAL 40
 #define IMP_DATA 0x7fffff
-#define CALIBUFSIZE 256
-#define LMS_MAX_DATA 90000
+#define CALIBUFSIZE 512
+#define LMS_MAX_DATA 40000
 
 static int sinmult;
 static int filter_taps[COEF_COUNT];
@@ -178,7 +178,7 @@ int play_next_period(struct runtime *run, int fix)
 		printf("PLAY: failed ioctl: %d, fd: %d\n", ret * errno, run->fd);
 	}
 
-	if (verbose) printf("Start Playing.. %08x count %d\n", run->current, run->count);
+	if (verbose) printf("Start Playing.. %08lx count %d\n", run->current, run->count);
 	ret = ioctl(run->fd, KONAMI_START_PLAY);
 	if (ret) {
 		printf("Failed ioctl: %d\n", ret * errno);
@@ -205,7 +205,7 @@ int record_next_period(struct runtime *run)
 		printf("REC: failed ioctl: %d\n", ret * errno);
 	}
 
-	if (verbose) printf("Start Recording.. %08x count: %d\n", run->current, run->count);
+	if (verbose) printf("Start Recording.. %08lx count: %d\n", run->current, run->count);
 	ret = ioctl(run->fd, KONAMI_START_RECORD);
 	if (ret) {
 		printf("Failed ioctl: %d\n", ret * errno);
@@ -234,6 +234,8 @@ int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
 		printf("Can't open %s\n", devpath);
 		return -1;
 	}
+
+	return 0;
 }
 
 #define DTHRSHOLD 0x400000 //(0.5) * (2^23)
@@ -243,7 +245,7 @@ static
 int calibrate_delay(void)
 {
 	int j;
-	int delay;
+	int delay = 0;
 
 	for(j = 0; j < CALIBUFSIZE; j++) {
 		int e = calibuf1[j] - calibuf1[j-1];
@@ -264,7 +266,8 @@ static
 int calibrate_delay2(void)
 {
 	int j;
-	int delay1, delay2;
+	int delay1 = 0, delay2 = 0;
+	float dist = 0.;
 	
 	for (j = 0; j < CALIBUFSIZE; j++) {
 		int d1 = calibuf1[j] - calibuf1[j-1];
@@ -286,7 +289,9 @@ int calibrate_delay2(void)
 		delay2++;
 	}
 
-	printf("delay2 - delay1 = %d\n", delay2 - delay1);
+	dist = ((float)((delay2 - delay1)/441.0)) * 340.29;
+
+	printf("delay2 - delay1 = %d (%.1f cm)\n", delay2 - delay1, dist);
 
 	return delay2 - delay1;
 }
@@ -295,9 +300,8 @@ int calibrate_delay2(void)
 static 
 void receive_period(struct runtime *rx)
 {
-	int offset, i, c;
+	int offset, i;
 	char buf[3];
-	int total = 0;
 	offset = i = rx->count * BUFSIZE/4;
 
 	while (i < offset + BUFSIZE/4) {
@@ -308,7 +312,7 @@ void receive_period(struct runtime *rx)
 		buf[1] = (x >> 8) & 0xff;
 		buf[2] = (x >> 16) & 0xff;
 
-		if (stop_all_threads) break;
+		if (stop_all_threads == 1) break;
 		switch (mode) {
 			case MODE_LMS_LEARN:
 				if ((!waitfordelay && left) && target->xcount < target->max)
@@ -340,7 +344,8 @@ void receive_period(struct runtime *rx)
 						}
 						break;
 					case EQ_LMS_LEARN:
-						if ((!waitfordelay && left) && target->xcount < target->max)
+					case EQ_TEST:
+						if (!waitfordelay && left && (target->xcount < target->max)) 
 							target->x[target->xcount++] = fix2fl(sext(x));
 						break;
 					default:
@@ -385,10 +390,11 @@ int set_period(struct runtime *tx)
 	if (tx->count == BUFCOUNT) i = offset = 0;
 	else i = offset = tx->count * BUFSIZE/4;
 
-	ret = 0; d = 0;
-	if (verbose) printf("i = %d\n", i);
+	ret = 1; d = 0;
 	while (i < offset + BUFSIZE/4) {
 		int left = !(i % 2);
+
+		if (stop_all_threads == 1) return 0;
 		switch (mode) {
 			case MODE_PLAY:
 			case MODE_PLAY_RECORD:
@@ -461,6 +467,7 @@ void *record_loop(void *runtime)
 	/* synchronize with other threads */
 	pthread_mutex_lock(&start_mutex);
 	rx->filesize = 0;
+	rx->count = 0;
 	samplecount = 0;
 	unstarted--;
 	while (unstarted > 0) {
@@ -469,13 +476,24 @@ void *record_loop(void *runtime)
 	}
 	pthread_mutex_unlock(&start_mutex);
 
-	while (!stop_all_threads) {
+	while (1) {
 		if (!record_next_period(rx)) continue;
 
 		pfd.fd = rx->fd;
 		pfd.events = POLLIN | POLLRDNORM;
 
-		ret = poll(&pfd, 1, 200); 
+		ret = poll(&pfd, 1, 12); 
+
+		if (ret > 0) {
+			if (verbose) printf("RX polled\n");
+			if (pfd.revents & POLLRDNORM) {
+				receive_period(rx);
+				rx->count++;
+			}
+		} else {
+			printf("rx timeout\n");
+			goto _exit;
+		}
 
 		switch (mode) {
 			case MODE_LMS_LEARN:
@@ -500,10 +518,12 @@ void *record_loop(void *runtime)
 					if (target->xcount >= target->max) {
 						int j;
 						lms_learn(target);
+
 						for (j = 0; j < target->max; j++) {
 							fwrite(&target->v[j], sizeof(double), 1, reff);
 							fwrite(&target->x[j], sizeof(double), 1, resf);
 						}
+
 						lms_complete(target);
 						printf("Learn Complete\n");
 						stop_all_threads = 1;
@@ -514,26 +534,20 @@ void *record_loop(void *runtime)
 				break;
 		}
 
-		if (ret > 0) {
-			if (pfd.revents & POLLRDNORM) {
-				receive_period(rx);
-				rx->count++;
-			}
-		} else {
-			printf("rx timeout\n");
-		}
+		if (stop_all_threads == 1) break;
 	}
 
 _exit:
-	printf("RX Thread #%d exited\n", rx->modnum);
+	//printf("RX Thread #%d exited\n", rx->modnum);
 	pthread_exit(NULL);
 }
+
 
 static 
 void *play_loop(void *runtime)
 {
 	struct pollfd pfd;
-	int ret = 0; int i;
+	int ret = 0; 
 	struct runtime *tx = (struct runtime *)runtime;
 	
 	if ((!tx->enable || tx->modnum != modnum) && mode != MODE_ANC) 
@@ -550,7 +564,9 @@ void *play_loop(void *runtime)
 	}
 	pthread_mutex_unlock(&start_mutex);
 
-	while (!stop_all_threads) {
+	while (1) {
+		/* set_period() and play_next_period() must stay
+			at the same tx->count */
 		if (!play_next_period(tx, 0)) continue;
 	
 		pfd.fd = tx->fd;
@@ -561,8 +577,8 @@ void *play_loop(void *runtime)
 		if (ret > 0) {
 			if (verbose) printf("TX polled\n");
 			if (pfd.revents & POLLWRNORM) {
-				if (set_period(tx) < 0) break;
 				tx->count++;
+				if (set_period(tx) == 0) break;
 			}
 		} else {
 			printf("tx timeout\n"); break;
@@ -570,10 +586,12 @@ void *play_loop(void *runtime)
 
 		if (mode == MODE_PLAY_FIX_RECORD)
 			interval = (interval == IMP_INTERVAL ? 0 : interval + 1);
+
+		if (stop_all_threads == 1) break;
 	} 
 
 _exit:
-	printf("TX Thread #%d exited\n", tx->modnum);
+	//printf("TX Thread #%d exited\n", tx->modnum);
 	pthread_exit(NULL);
 }
 
@@ -604,11 +622,10 @@ int main(int argc, char **argv)
 {
 	struct runtime *rxrun, *txrun;
 	struct runtime *rxrun2, *txrun2;
-	int i, j, ret, coef;
+	int i, j, coef;
 	unsigned long *coefbuf;
 	unsigned long *coefbuf2;
 	FILE *coeff = NULL;
-	FILE *coeff2 = NULL;
 	pthread_t playback_thread[2];
 	pthread_t record_thread[2];
 	char playback_filename[32] = "";
@@ -653,6 +670,7 @@ int main(int argc, char **argv)
 	init_module(rxrun2, txrun2, 2);
 	fixtype = 0;
 
+	delaysize = 0;
 	while ((c = getopt_long(argc, argv, short_options, long_options, &option_index)) != -1) {
 		switch (c) {
 			case 'C':
@@ -755,7 +773,7 @@ int main(int argc, char **argv)
 	for (i = 0; i < COEF_COUNT; i++) {
 		coefbuf[i] = filter_taps[i];
 		coefbuf2[i] = filter_taps[i];
-		//printf("%d\n", coefbuf[i]);
+		//printf("%d\n", coefbuf2[i]);
 	}
 
 	/* Begin */
@@ -773,7 +791,12 @@ int main(int argc, char **argv)
 	enable_i2s(1);
 	enable_i2s(2);
 
-	delaysize = 0;
+	/* Flush the last remaining RX & TX buffer */
+	record_next_period(rxrun);
+	record_next_period(rxrun2);
+	play_next_period(txrun, 0);
+	play_next_period(txrun2, 0);
+
 	/* Main Loop */
 	int exit_loop = 0; 
 	while (1) {
@@ -813,6 +836,12 @@ int main(int argc, char **argv)
 			switch (anc_stat) {
 				case ANC_CALIBRATE_DELAY:
 					printf("ANC delay finished\n");
+					delaysize = 0;
+					txrun2->enable = 0;
+					rxrun2->enable = 1;
+					txrun->enable = 1;
+					rxrun->enable = 0;
+					anc_stat = ANC_CANCELLATION;
 					exit_loop = 1;
 					break;
 				case ANC_CANCELLATION:
@@ -826,12 +855,13 @@ int main(int argc, char **argv)
 			switch (eq_stat) {
 				case EQ_CALIBRATE_DELAY:
 					printf("Equalizer LMS Learn started..\n");
+					free(target);
 					target = lms_init(COEF_COUNT, LMS_MAX_DATA, MU);
 					strcpy(playback_filename, "imp.wav");
 					eq_stat = EQ_LMS_LEARN;
 					if (txrun->enable) close_files(txrun, rxrun);
 					if (txrun2->enable) close_files(txrun2, rxrun2);
-					delaysize -= 2; // a little calibration
+					delaysize -= 6; // a little calibration
 					sleep(1);
 					break;
 				case EQ_LMS_LEARN:
@@ -860,7 +890,7 @@ int main(int argc, char **argv)
 
 		icoeff = open_file("coef.txt", "w");
 		for (i = 0; i < COEF_COUNT; i++) {
-			fprintf(icoeff, "%d\n", fl2fix26(result[i]));
+			fprintf(icoeff, "%d\n", -1 * fl2fix24(result[i]));
 		}
 
 		printf("Learning finished.. \n");
@@ -881,12 +911,6 @@ int main(int argc, char **argv)
 		finalize_wav(rxrun->wav_file, rxrun->filesize);
 		finalize_wav(rxrun2->wav_file, rxrun2->filesize);
 	}
-
-	/* Flush the last remaining RX & TX buffer */
-	record_next_period(rxrun);
-	record_next_period(rxrun);
-	play_next_period(txrun, 0);
-	play_next_period(txrun2, 0);
 
 	close_files(txrun, rxrun);
 	close_files(txrun2, rxrun2);
