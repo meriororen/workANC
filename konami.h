@@ -61,9 +61,15 @@ struct descriptor {
 	uint32_t control;
 };
 
+struct module {
+	int modnum;
+	unsigned long *coefbuf;
+	struct runtime *rx;
+	struct runtime *tx;
+};
+
 struct runtime {
 	int fd;
-	int modnum;
 	int count;
 	int enable;
 	FILE *wav_file;
@@ -168,73 +174,71 @@ static size_t init_wav(FILE *file, int stereo)
 	return fwrite(sample_header, 1, sizeof(sample_header), file);
 }
 
-static void finalize_wav(FILE *file, int filesize) 
+static void finalize_wav(struct runtime *run)
 {
-		filesize -= 4;
-		if (filesize < 0) return;
+	FILE *file = run->wav_file;
 
-		//printf("size: %d\n", filesize);
-		fseek(file, 0x4, SEEK_SET);
-		fwrite(&filesize, 4, 1, file);
-		filesize += 0x24; // header size
-		fseek(file, 0x28, SEEK_SET);
-		fwrite(&filesize, 4, 1, file);
+	run->filesize -= 4;
+	if (run->filesize < 0) return;
+
+	//printf("size: %d\n", filesize);
+	fseek(file, 0x4, SEEK_SET);
+	fwrite(&run->filesize, 4, 1, file);
+	run->filesize += 0x24; // header size
+	fseek(file, 0x28, SEEK_SET);
+	fwrite(&run->filesize, 4, 1, file);
 }
 
-static void init_mode(struct runtime *rx, struct runtime *tx, int modnum)
+static void init_mode(struct module *m, int modnum)
 {
-	tx->enable = 0;
-	rx->enable = 0;
-
+	struct runtime *rx = m->rx;
+	struct runtime *tx = m->tx;
+	
 	switch (mode) {
 		case MODE_PLAY:
 		case MODE_PLAY_FIX:
-			if (modnum == tx->modnum) tx->enable = 1;
+			if (modnum == m->modnum) tx->enable = 1;
 			break;
 		case MODE_RECORD:
 		case MODE_REALTIME:
-			if (modnum == rx->modnum) rx->enable = 1;
+			if (modnum == m->modnum) rx->enable = 1;
 			break;
 		case MODE_PLAY_RECORD:
 		case MODE_PLAY_FIX_RECORD:
 		case MODE_LMS_LEARN:
 		case MODE_EQUAL_FILTER:
-			if (modnum == tx->modnum) {
+			if (modnum == m->modnum) {
 				tx->enable = 1;
 				rx->enable = 1;
 			}
 			break;
 		case MODE_ANC:
-			if (tx->modnum == 2) tx->enable = 1;
+			if (m->modnum == 2) tx->enable = 1;
 			rx->enable = 1;
 		default:
 			break;
 	}
-
-	rx->count = 0;
-	tx->count = 0;	
 }
 
-static void init_module(struct runtime *rx, struct runtime *tx, int modnum) 
+static void init_module(struct module *m) 
 {
-	rx->wav_file = NULL; 
-	tx->wav_file = NULL; 
-	rx->base = (modnum == 1) ? RX_BASE : RX_BASE2; 
-	tx->base = (modnum == 1) ? TX_BASE : TX_BASE2; 
-	rx->current = rx->base; 
-	tx->current = tx->base;
-	rx->modnum = modnum; 
-	tx->modnum = modnum;
+	struct runtime *rx = m->rx;
+	struct runtime *tx = m->tx;
+
+	rx->wav_file = NULL;
+	tx->wav_file = NULL;
+	rx->base = (m->modnum == 1) ? RX_BASE : RX_BASE2;
+	tx->base = (m->modnum == 1) ? TX_BASE : TX_BASE2; 
 }
 
-#define launch_thread_sync(th_id, loop, run) \
-	if (run->enable) {\
-		pthread_create(&th_id, NULL, loop, (void *)run); \
+#define launch_thread_sync(th_id, loop, x, mod) \
+	if (mod->x->enable) {\
+		pthread_create(&th_id, NULL, loop, (void *)mod); \
 		unstarted++; \
 	}
 
-#define join_thread(th_id, run) \
-	if (run->enable) \
+#define join_thread(th_id, x, mod) \
+	if (mod->x->enable) \
 		pthread_join(th_id, NULL)
 
 #endif

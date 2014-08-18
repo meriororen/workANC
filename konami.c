@@ -59,8 +59,11 @@ void fix_data_generate(int type)
 }
 
 static 
-int map_buffers(struct runtime *rx, struct runtime *tx)
+int map_buffers(struct module *m)
 {
+	struct runtime *rx = m->rx;
+	struct runtime *tx = m->tx;
+
 	int fd = open("/dev/mem", O_RDWR);
 	if (!fd) {
 		printf("Can't open memory\n");
@@ -215,11 +218,13 @@ int record_next_period(struct runtime *run)
 }
 
 static 
-int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
+int init_devices(struct module *m) 
 {
 	char devpath[16];
+	struct runtime *rx = m->rx;
+	struct runtime *tx = m->tx;
 	
-	sprintf(devpath, "/dev/c%dcapt", modulenum);
+	sprintf(devpath, "/dev/c%dcapt", m->modnum);
 
 	rx->fd = open(devpath, O_RDWR);
 	if (rx->fd < 0) {
@@ -227,7 +232,7 @@ int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
 		return -1;
 	} 
 
-	sprintf(devpath, "/dev/c%dplay", modulenum);
+	sprintf(devpath, "/dev/c%dplay", m->modnum);
 
 	tx->fd = open(devpath, O_RDWR);
 	if (tx->fd < 0) {
@@ -301,10 +306,11 @@ int calibrate_delay2(void)
 
 /* Receive one period (1 full buffer) */
 static 
-void receive_period(struct runtime *rx)
+void receive_period(struct module *m)
 {
 	int offset, i;
 	char buf[3];
+	struct runtime *rx = m->rx;
 	offset = i = rx->count * BUFSIZE/4;
 
 	while (i < offset + BUFSIZE/4) {
@@ -359,13 +365,13 @@ void receive_period(struct runtime *rx)
 			case MODE_ANC:
 				switch (anc_stat) {
 					case ANC_CALIBRATE_DELAY:
-						if (calibc1 < CALIBUFSIZE && rx->modnum == 2)
+						if (calibc1 < CALIBUFSIZE && m->modnum == 2)
 							if (left) calibuf1[calibc1++] = sext(x);
-						if (calibc2 < CALIBUFSIZE && rx->modnum == 1)
+						if (calibc2 < CALIBUFSIZE && m->modnum == 1)
 							if (left) calibuf2[calibc2++] = sext(x);
 
 						if (calibc1 >= CALIBUFSIZE && calibc2 >= CALIBUFSIZE &&
-							 rx->modnum == 2) {
+							 m->modnum == 2) {
 							delaysize = calibrate_delay2();
 							stop_all_threads = 1;
 							return;
@@ -385,10 +391,11 @@ void receive_period(struct runtime *rx)
 
 /* Set one period (1 full buffer) */
 static 
-int set_period(struct runtime *tx)
+int set_period(struct module *m)
 {
 	unsigned long d, w;
 	int i, offset, ret; 
+	struct runtime *tx = m->tx;
 
 	if (tx->count == BUFCOUNT) i = offset = 0;
 	else i = offset = tx->count * BUFSIZE/4;
@@ -458,13 +465,14 @@ int set_period(struct runtime *tx)
 }
 
 static 
-void *record_loop(void *runtime)
+void *record_loop(void *module)
 {
 	struct pollfd pfd;
 	int ret = 0;
-	struct runtime *rx = (struct runtime *)runtime;
+	struct module *m = (struct module *)module;
+	struct runtime *rx = m->rx;
 
-	if ((!rx->enable || rx->modnum != modnum) && mode != MODE_ANC) 
+	if ((!rx->enable || m->modnum != modnum) && mode != MODE_ANC) 
 		goto _exit;
 
 	/* synchronize with other threads */
@@ -490,7 +498,7 @@ void *record_loop(void *runtime)
 		if (ret > 0) {
 			if (verbose) printf("RX polled\n");
 			if (pfd.revents & POLLRDNORM) {
-				receive_period(rx);
+				receive_period(m);
 				rx->count++;
 			}
 		} else {
@@ -541,25 +549,26 @@ void *record_loop(void *runtime)
 	}
 
 _exit:
-	//printf("RX Thread #%d exited\n", rx->modnum);
+	printf("RX Thread #%d exited\n", m->modnum);
 	pthread_exit(NULL);
 }
 
 
 static 
-void *play_loop(void *runtime)
+void *play_loop(void *module)
 {
 	struct pollfd pfd;
 	int ret = 0; 
-	struct runtime *tx = (struct runtime *)runtime;
+	struct module *m = (struct module *)module;
+	struct runtime *tx = m->tx;
 	
-	if ((!tx->enable || tx->modnum != modnum) && mode != MODE_ANC) 
+	if ((!tx->enable || m->modnum != modnum) && mode != MODE_ANC) 
 		goto _exit;
 
 	/* synchronize with other threads */
 	pthread_mutex_lock(&start_mutex);
 	tx->count = 0;
-	set_period(tx);
+	set_period(m);
 	unstarted--;
 	while (unstarted > 0) {
 		pthread_mutex_unlock(&start_mutex);
@@ -581,7 +590,7 @@ void *play_loop(void *runtime)
 			if (verbose) printf("TX polled\n");
 			if (pfd.revents & POLLWRNORM) {
 				tx->count++;
-				if (set_period(tx) == 0) break;
+				if (set_period(m) == 0) break;
 			}
 		} else {
 			printf("tx timeout\n"); break;
@@ -594,41 +603,41 @@ void *play_loop(void *runtime)
 	} 
 
 _exit:
-	//printf("TX Thread #%d exited\n", tx->modnum);
+	printf("TX Thread #%d exited\n", m->modnum);
 	pthread_exit(NULL);
 }
 
 
 static 
-int init_files(struct runtime *txrun, struct runtime *rxrun,
-					const char *playback_filename, const char *record_filename)
+int init_files(struct module *m, const char *playback_filename, const char *record_filename)
 {
-	if (txrun->enable && !fixtype) {
-		if((txrun->wav_file = open_file(playback_filename, "r")) == NULL) return -1;
-		fseek(txrun->wav_file, 0x2C, SEEK_SET); 
+	struct runtime *rx = m->rx;
+	struct runtime *tx = m->tx;
+
+	if (tx->enable && !fixtype) {
+		if((tx->wav_file = open_file(playback_filename, "r")) == NULL) return -1;
+		fseek(tx->wav_file, 0x2C, SEEK_SET); 
 	}
 
-	if (rxrun->enable) {
-		if((rxrun->wav_file = open_file(record_filename, "wb+")) == NULL) return -1;
-		init_wav(rxrun->wav_file, 1);
+	if (rx->enable) {
+		if((rx->wav_file = open_file(record_filename, "wb+")) == NULL) return -1;
+		init_wav(rx->wav_file, 1);
 	}
 
 	return 0;
 }
 
 static
-void close_files(struct runtime *txrun, struct runtime *rxrun) {
-	if (txrun->wav_file) fclose(txrun->wav_file);
-	if (rxrun->wav_file) fclose(rxrun->wav_file);
+void close_files(struct module *m) 
+{
+	if (m->tx->wav_file) fclose(m->tx->wav_file);
+	if (m->rx->wav_file) fclose(m->rx->wav_file);
 }
 
 int main(int argc, char **argv)
 {
-	struct runtime *rxrun, *txrun;
-	struct runtime *rxrun2, *txrun2;
+	struct module *m1, *m2;
 	int i, j, coef;
-	unsigned long *coefbuf;
-	unsigned long *coefbuf2;
 	FILE *coeff = NULL;
 	pthread_t playback_thread[2];
 	pthread_t record_thread[2];
@@ -665,13 +674,18 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	rxrun = malloc(sizeof(struct runtime));
-	txrun = malloc(sizeof(struct runtime));
-	rxrun2 = malloc(sizeof(struct runtime));
-	txrun2 = malloc(sizeof(struct runtime));
+	m1 = malloc(sizeof(struct module));
+	m2 = malloc(sizeof(struct module));
 
-	init_module(rxrun, txrun, 1);
-	init_module(rxrun2, txrun2, 2);
+	m1->modnum = 1; m2->modnum = 2;
+
+	m1->rx = malloc(sizeof(struct runtime));
+	m1->tx = malloc(sizeof(struct runtime));
+	m2->rx = malloc(sizeof(struct runtime));
+	m2->tx = malloc(sizeof(struct runtime));
+
+	init_module(m1);
+	init_module(m2);
 	fixtype = 0;
 
 	delaysize = 0;
@@ -762,27 +776,27 @@ int main(int argc, char **argv)
 	}
 
 	/* Allocate buffers */
-	if(map_buffers(rxrun, txrun) < 0) return -1;
-	if(map_buffers(rxrun2, txrun2) < 0) return -1;
+	if(map_buffers(m1) < 0) return -1;
+	if(map_buffers(m2) < 0) return -1;
 
 	/* Map coefficient buffer */
-	if (map_coef_buffer(&coefbuf, 1) < 0) return -1;
-	if (map_coef_buffer(&coefbuf2, 2) < 0) return -1;
+	if (map_coef_buffer(&m1->coefbuf, 1) < 0) return -1;
+	if (map_coef_buffer(&m2->coefbuf, 2) < 0) return -1;
 
 	/* Open devices */
-	if(init_devices(rxrun, txrun, 1) < 0) return -1;
-	if(init_devices(rxrun2, txrun2, 2) < 0) return -1;
+	if(init_devices(m1) < 0) return -1;
+	if(init_devices(m2) < 0) return -1;
 
 	//printf("Setting Coefficients..\n");
 	for (i = 0; i < COEF_COUNT; i++) {
-		coefbuf[i] = filter_taps[i];
-		coefbuf2[i] = filter_taps[i];
-		//printf("%d\n", coefbuf2[i]);
+		m1->coefbuf[i] = filter_taps[i];
+		m2->coefbuf[i] = filter_taps[i];
+		//printf("%d\n", m2->coefbuf[i]);
 	}
 
 	/* Begin */
-	init_mode(rxrun, txrun, modnum);
-	init_mode(rxrun2, txrun2, modnum);
+	init_mode(m1, modnum);
+	init_mode(m2, modnum);
 
 	if (reff == NULL || resf == NULL) {
 		reff = open_file(reference_data, "wb+");
@@ -796,25 +810,25 @@ int main(int argc, char **argv)
 	enable_i2s(2);
 
 	/* Flush the last remaining RX & TX buffer */
-	record_next_period(rxrun);
-	record_next_period(rxrun2);
-	play_next_period(txrun, 0);
-	play_next_period(txrun2, 0);
+	record_next_period(m1->rx);
+	record_next_period(m2->rx);
+	play_next_period(m1->tx, 0);
+	play_next_period(m2->tx, 0);
 
 	/* Main Loop */
 	int exit_loop = 0; 
 	while (1) {
-		if (init_files(txrun, rxrun, playback_filename, record_filename) < 0) break;
-		if (init_files(txrun2, rxrun2, playback_filename, record_filename) < 0) break;
+		if (init_files(m1, playback_filename, record_filename) < 0) break;
+		if (init_files(m2, playback_filename, record_filename) < 0) break;
 	
 		stop_all_threads = 0;
 		pthread_mutex_lock(&start_mutex);
 		unstarted = 0;
 
-		launch_thread_sync(record_thread[0], record_loop, rxrun); 
-		launch_thread_sync(record_thread[1], record_loop, rxrun2);
-		launch_thread_sync(playback_thread[0], play_loop, txrun);
-		launch_thread_sync(playback_thread[1], play_loop, txrun2);
+		launch_thread_sync(record_thread[0], record_loop, rx, m1); 
+		launch_thread_sync(record_thread[1], record_loop, rx, m2);
+		launch_thread_sync(playback_thread[0], play_loop, tx, m1);
+		launch_thread_sync(playback_thread[1], play_loop, tx, m2);
 
 		pthread_mutex_unlock(&start_mutex);
 
@@ -831,20 +845,20 @@ int main(int argc, char **argv)
 				stop_all_threads = 1;
 		}
 
-		join_thread(record_thread[0], rxrun);
-		join_thread(record_thread[1], rxrun2);
-		join_thread(playback_thread[0], txrun);
-		join_thread(playback_thread[1], txrun2);
+		join_thread(record_thread[0], rx, m1);
+		join_thread(record_thread[1], rx, m2);
+		join_thread(playback_thread[0], tx, m1);
+		join_thread(playback_thread[1], tx, m2);
 
 		if (mode == MODE_ANC) {
 			switch (anc_stat) {
 				case ANC_CALIBRATE_DELAY:
 					printf("ANC delay finished\n");
 					delaysize = 0;
-					txrun2->enable = 0;
-					rxrun2->enable = 1;
-					txrun->enable = 1;
-					rxrun->enable = 0;
+					m2->tx->enable = 0;
+					m2->rx->enable = 1;
+					m1->tx->enable = 1;
+					m1->rx->enable = 0;
 					anc_stat = ANC_CANCELLATION;
 					exit_loop = 1;
 					break;
@@ -863,9 +877,9 @@ int main(int argc, char **argv)
 					target = lms_init(COEF_COUNT, LMS_MAX_DATA, MU);
 					strcpy(playback_filename, "imp.wav");
 					eq_stat = EQ_LMS_LEARN;
-					if (txrun->enable) close_files(txrun, rxrun);
-					if (txrun2->enable) close_files(txrun2, rxrun2);
-					delaysize -= 6; // a little calibration
+					if (m1->tx->enable) close_files(m1);
+					if (m2->tx->enable) close_files(m2);
+					delaysize -= 10; // a little calibration
 					sleep(1);
 					break;
 				case EQ_LMS_LEARN:
@@ -912,18 +926,19 @@ int main(int argc, char **argv)
 	//}
 
 	if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD) {
-		finalize_wav(rxrun->wav_file, rxrun->filesize);
-		finalize_wav(rxrun2->wav_file, rxrun2->filesize);
+		finalize_wav(m1->rx);
+		finalize_wav(m2->rx);
 	}
 
-	close_files(txrun, rxrun);
-	close_files(txrun2, rxrun2);
+	close_files(m1);
+	close_files(m2);
 	if (reff) fclose(reff); 
 	if (resf) fclose(resf);
 
 finish:
-	free(rxrun); free(txrun);
-	free(rxrun2); free(txrun2);
+	free(m1->rx); free(m1->tx);
+	free(m2->rx); free(m2->tx);
+	free(m1); free(m2);
 	fclose(coeff);
 	return 0;
 }
