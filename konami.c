@@ -9,7 +9,7 @@
 
 #define IMP_INTERVAL 40
 #define IMP_DATA 0x7fffff
-#define CALIBUFSIZE 512
+#define CALIBUFSIZE 256
 #define LMS_MAX_DATA 40000
 
 static int sinmult;
@@ -238,7 +238,7 @@ int init_devices(struct runtime *rx, struct runtime *tx, int modulenum)
 	return 0;
 }
 
-#define DTHRSHOLD 0x400000 //(0.5) * (2^23)
+#define DTHRSHOLD 0x599999 //(0.7) * (2^23)
 #define DTHRSHOLD2 0x66666 //(0.05) * (2^23)
 
 static
@@ -248,10 +248,11 @@ int calibrate_delay(void)
 	int delay = 0;
 
 	for(j = 0; j < CALIBUFSIZE; j++) {
-		int e = calibuf1[j] - calibuf1[j-1];
+		//	int e = calibuf1[j] - calibuf1[j-1];
 		//printf("%d : %d [%d] %d\n", calibuf0[j], calibuf1[j], j, e);
 		if (calibuf0[j] == IMP_DATA) delay = 0;
-		if (e > DTHRSHOLD) { 
+		//if (e > DTHRSHOLD) { 
+		if (calibuf1[j] > DTHRSHOLD) {
 			printf("delay = %d\n", delay);
 			return delay;
 		}
@@ -270,9 +271,10 @@ int calibrate_delay2(void)
 	float dist = 0.;
 	
 	for (j = 0; j < CALIBUFSIZE; j++) {
-		int d1 = calibuf1[j] - calibuf1[j-1];
+		//int d1 = calibuf1[j] - calibuf1[j-1];
 		if (calibuf0[j] == IMP_DATA) delay1 = 0;
-		if (d1 > DTHRSHOLD) {
+		//if (d1 > DTHRSHOLD) {
+		if (calibuf1[j] > DTHRSHOLD) {
 			printf("delay1 = %d\n", delay1);
 			break;
 		}
@@ -280,9 +282,10 @@ int calibrate_delay2(void)
 	}
 
 	for (j = 0; j < CALIBUFSIZE; j++) {
-		int d2 = calibuf2[j] - calibuf2[j-1];
+		//int d2 = calibuf2[j] - calibuf2[j-1];
 		if (calibuf0[j] == IMP_DATA) delay2 = 0;
-		if (d2 > DTHRSHOLD2) {
+		//if (d2 > DTHRSHOLD2) {
+		if (calibuf2[j] > DTHRSHOLD2) {
 			printf("delay2 = %d\n", delay2);
 			break;
 		}
@@ -595,6 +598,7 @@ _exit:
 	pthread_exit(NULL);
 }
 
+
 static 
 int init_files(struct runtime *txrun, struct runtime *rxrun,
 					const char *playback_filename, const char *record_filename)
@@ -899,13 +903,13 @@ int main(int argc, char **argv)
 		free(result);
 	}
 
-	if (mode == MODE_ANC) {
+	//if (mode == MODE_ANC) {
 		for(i = 0; i < CALIBUFSIZE; i++) {
 			fwrite(&calibuf0[i], sizeof(long), 1, reff);
 			fwrite(&calibuf1[i], sizeof(long), 1, resf);
 			fwrite(&calibuf2[i], sizeof(long), 1, resf2);
 		}
-	}
+	//}
 
 	if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD) {
 		finalize_wav(rxrun->wav_file, rxrun->filesize);
