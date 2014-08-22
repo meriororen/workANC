@@ -28,6 +28,11 @@
 #define RX_BASE2  0xC1000000
 #define TX_BASE2  0xD1000000
 
+#define CODEC1_COEF_BASE 0xFF241000
+#define CODEC2_COEF_BASE 0xFF251000
+#define CODEC1_I2S_BASE 0xFF240000
+#define CODEC2_I2S_BASE 0xFF250000
+
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
 #define BUFSIZE CHANNELS * 55 * WORDSIZE 
 #define BUFCOUNT 4
@@ -48,7 +53,7 @@
 #define AMPLITUDE (pow(2, SAMPLE_BIT- 1))
 
 /* FIR Coefficient */
-#define COEF_COUNT 64
+#define COEF_COUNT 112
 #define I2S_BASE 0xFF240000
 
 /* Sign extend */
@@ -64,8 +69,10 @@ struct descriptor {
 struct module {
 	int modnum;
 	unsigned long *coefbuf;
+	unsigned long *i2sconfig;
 	struct runtime *rx;
 	struct runtime *tx;
+	struct module *m;
 };
 
 struct runtime {
@@ -73,6 +80,7 @@ struct runtime {
 	int count;
 	int enable;
 	FILE *wav_file;
+	int stereo;
 	unsigned long current;
 	unsigned long *buf;
 	unsigned int filesize; /* for rx only */
@@ -96,7 +104,6 @@ typedef enum {
 typedef enum {
 	EQ_IDLE,
 	EQ_START,
-	EQ_CALIBRATE_DELAY,
 	EQ_LMS_LEARN,
 	EQ_TEST,
 } eq_state_t;
@@ -131,7 +138,7 @@ static inline int fl2fix(double s)
 static inline int fl2fix24(double s)
 {
 	//return (int) ceil(s * (0x00000000007ffffF + 0.5));
-	return (int) ceil(s * ((double ) pow(2, 22) + 0.5));
+	return (int) ceil(s * ((double ) pow(2, 23) + 0.5));
 }
 
 static FILE * open_file(const char *filename, const char *mode) 
@@ -189,36 +196,6 @@ static void finalize_wav(struct runtime *run)
 	fwrite(&run->filesize, 4, 1, file);
 }
 
-static void init_mode(struct module *m, int modnum)
-{
-	struct runtime *rx = m->rx;
-	struct runtime *tx = m->tx;
-	
-	switch (mode) {
-		case MODE_PLAY:
-		case MODE_PLAY_FIX:
-			if (modnum == m->modnum) tx->enable = 1;
-			break;
-		case MODE_RECORD:
-		case MODE_REALTIME:
-			if (modnum == m->modnum) rx->enable = 1;
-			break;
-		case MODE_PLAY_RECORD:
-		case MODE_PLAY_FIX_RECORD:
-		case MODE_LMS_LEARN:
-		case MODE_EQUAL_FILTER:
-			if (modnum == m->modnum) {
-				tx->enable = 1;
-				rx->enable = 1;
-			}
-			break;
-		case MODE_ANC:
-			if (m->modnum == 2) tx->enable = 1;
-			rx->enable = 1;
-		default:
-			break;
-	}
-}
 
 static void init_module(struct module *m) 
 {

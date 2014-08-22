@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
 	if (write_command(fd, buf, 3, "ENABLE RECORD MIXER LEFT")) goto exit;
 	
 	/* Digital volume (AD) Attenuator (Negative dB) */
-	construct_cmd(0x1A, 0x10, buf);
+	construct_cmd(0x1A, 0x16, buf);
 	if (write_command(fd, buf, 3, "DIGITAL VOLUME (LADVOL)")) goto exit;
 	
 	val = 10;
@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
 #define PGA
 #ifdef PGA
 	/*	LDBOOST = 0dB */
-	if (argc > 1 && !strcmp(argv[1], "boost")) {
+	if (argc > 1 && !strcmp(argv[1], "0dB")) {
 		val = 0x08;
 	} else {
 		val = 0x10;
@@ -268,7 +268,7 @@ int main(int argc, char **argv) {
    /*			                                  |-> to playback */
 	/* LDVOL Control (Differential Control) */
 	/* LDVOL[5:0] | LDMUTE | LDEN */
-	val = (0x25 << 2) | (1 << 1) | 1;
+	val = (0x20 << 2) | (1 << 1) | 1;
 	construct_cmd(0x0E, val, buf);
 	if (write_command(fd, buf, 3, "LEFT DIFF INPUT VOL CONTROL")) goto exit;
 
@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
 	/* Set Up ADC */
 	/* Invert polarity (it comes from LINN) */
 	/* HPF enabled */
-	construct_cmd(0x19, 0x61, buf);
+	construct_cmd(0x19, 0x41, buf);
 	if (write_command(fd, buf, 3, "ADC ENABLE (BOTH)")) goto exit;
 
 	/* Enable DAC */
