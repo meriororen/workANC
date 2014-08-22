@@ -12,8 +12,10 @@ orz_lms.o: orz_lms.c orz_lms.h
 	gcc -c $(CFLAGS) $^
 least_square.o: least_square.c konami.h
 	gcc -c $(CFLAGS) $(CFLAGS2) $^
+button.o: button.c
+	gcc -c $(CFLAGS) $^
 
-konami: orz_lms.o least_square.o konami.o
+konami: orz_lms.o least_square.o button.o konami.o
 	$(CC) -o k $^ $(LDFLAGS)
 
 i2c: i2c.o

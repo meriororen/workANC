@@ -59,6 +59,12 @@
 /* Sign extend */
 #define sext(x) (x & 0x800000 ? x | 0xFF000000 : x & 0x00FFFFFF)
 
+#define GPIO_PATH	 "/sys/class/gpio"
+
+/* GPIO buttons */
+#define BUTTON0 154
+#define BUTTON1 155
+
 struct descriptor {
 	uint32_t read_address;
 	uint32_t write_address;
@@ -118,11 +124,14 @@ typedef enum {
 static audio_mode_t mode = MODE_NONE;
 static eq_state_t eq_stat = EQ_IDLE;
 static anc_state_t anc_stat = ANC_IDLE;
+extern int button_fd;
 
 #define FIX_SINE 1
 #define FIX_IMPULSE 2
 
 int calc_filter_lsq(double *impulse, double *result);
+int monitor_button(int num);
+void btn_gpio_init(void);
 
 static inline double fix2fl(int s) 
 {

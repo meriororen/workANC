@@ -9,7 +9,7 @@
 
 #define IMP_INTERVAL 40
 #define IMP_DATA 0x7fffff
-#define CALIBUFSIZE 256
+#define CALIBUFSIZE 512
 #define LMS_MAX_DATA 60000
 
 static int sinmult;
@@ -27,9 +27,9 @@ static int verbose = 0;
 static int calibc0 = 0; 
 static int calibc1 = 0;
 static int calibc2 = 0;
-static long calibuf0[CALIBUFSIZE];
-static long calibuf1[CALIBUFSIZE];
-static long calibuf2[CALIBUFSIZE];
+static int calibuf0[CALIBUFSIZE];
+static int calibuf1[CALIBUFSIZE];
+static int calibuf2[CALIBUFSIZE];
 static lms_t *target;
 static int unstarted = 0;
 static FILE *reff;
@@ -110,6 +110,8 @@ void init_mode(struct module *m)
 	struct runtime *rx = m->rx;
 	struct runtime *tx = m->tx;
 	
+	configure_i2s(m, 0, 0);
+	
 	switch (mode) {
 		case MODE_PLAY:
 		case MODE_PLAY_FIX:
@@ -131,20 +133,21 @@ void init_mode(struct module *m)
 			}
 			break;
 		case MODE_ANC:
-			if (m->modnum == 2) {
-				rx->enable = 1;
-				configure_i2s(m, 1, 0); /* rx short, tx mem */
-			} 
-			if (m->modnum == 1) {	 /* codec1 */
-				tx->enable = 1;
-				configure_i2s(m, 0, 1); /* rx mem, tx short */
+			if (anc_stat == ANC_CALIBRATE_DELAY) {
+				if (m->modnum == 2) {
+					tx->enable = 1; 
+					configure_i2s(m, 1, 0); /* rx short, tx mem */
+				} 
+				if (m->modnum == 1) {	 /* codec1 */
+					rx->enable = 1;
+					configure_i2s(m, 0, 1); /* rx mem, tx short */
+				}
+			} else if (anc_stat == ANC_CANCELLATION) {
+				printf("Not implemented (yet)\n");
 			}
 		default:
 			break;
 	}
-
-	if (m->modnum == 2) configure_i2s(m, 1, 0); /* rx short, tx mem */
-	if (m->modnum == 1) configure_i2s(m, 0, 1); /* rx mem, tx short */
 }
 
 static 
@@ -737,6 +740,7 @@ int main(int argc, char **argv)
 	char response_data[16] = "res";
 	char response_data2[16] = "res2";
 	char reference_data[16] = "ref"; 
+	char btn_path[50];
 	int nofilter = 0;
 	struct sigaction sa;
 
@@ -799,8 +803,8 @@ int main(int argc, char **argv)
 			case 'a':
 				mode = MODE_ANC;
 				strcpy(playback_filename, "imp.wav");
-				//anc_stat = ANC_CALIBRATE_DELAY;
-				anc_stat = ANC_CANCELLATION;
+				anc_stat = ANC_CALIBRATE_DELAY;
+				//anc_stat = ANC_CANCELLATION;
 				break;
 			case 'q':
 				mode = MODE_EQUAL_FILTER;
@@ -908,8 +912,25 @@ int main(int argc, char **argv)
 	play_next_period(m1->tx, 0);
 	play_next_period(m2->tx, 0);
 
+
+	/* Button initialization */
+
+	sprintf(btn_path, "%s/gpio%d/value", GPIO_PATH, BUTTON0);
+	if (access(btn_path, F_OK) < 0) btn_gpio_init();
+
+	sprintf(btn_path, "%s/gpio%d/value", GPIO_PATH, BUTTON0);
+	button_fd = open(btn_path, O_RDONLY);
+	if (button_fd < 0) { 
+		printf("Cannot open BUTTON0\n"); 
+		exit(EXIT_FAILURE);
+	}
+
 	/* Main Loop */
 	int exit_loop = 0; 
+	if (m1->tx->enable) printf("Module 1 TX\n");
+	if (m1->rx->enable) printf("Module 1 RX\n");
+	if (m2->tx->enable) printf("Module 2 TX\n");
+	if (m2->rx->enable) printf("Module 2 RX\n");
 	while (1) {
 		if (init_files(m1, playback_filename, record_filename) < 0) break;
 		if (init_files(m2, playback_filename, record_filename) < 0) break;
@@ -932,10 +953,10 @@ int main(int argc, char **argv)
 
 		while (1) {
 			/* just idle loop on main thread */
-			usleep(1);
 			if (stop_all_threads == 1) break;
 			if (signal_received == SIGINT) 
 				stop_all_threads = 1;
+			monitor_button(BUTTON0);
 		}
 
 		join_thread(record_thread[0], rx, m1);
@@ -953,6 +974,7 @@ int main(int argc, char **argv)
 					m1->tx->enable = 0;
 					m1->rx->enable = 0;
 					anc_stat = ANC_CANCELLATION;
+					exit_loop = 1;
 					break;
 				case ANC_CANCELLATION:
 					exit_loop = 1;
@@ -999,13 +1021,14 @@ int main(int argc, char **argv)
 		free(result);
 	}
 
-	//if (mode == MODE_ANC) {
+	if (mode != MODE_EQUAL_FILTER) {
+		double a0, a1, a2;
 		for(i = 0; i < CALIBUFSIZE; i++) {
-			fwrite(&calibuf0[i], sizeof(long), 1, reff);
-			fwrite(&calibuf1[i], sizeof(long), 1, resf);
-			fwrite(&calibuf2[i], sizeof(long), 1, resf2);
+			a0 = fix2fl(calibuf0[i]); fwrite(&a0, sizeof(double), 1, reff);
+			a1 = fix2fl(calibuf1[i]); fwrite(&a1, sizeof(double), 1, resf);
+			a2 = fix2fl(calibuf2[i]); fwrite(&a2, sizeof(double), 1, resf2);
 		}
-	//}
+	}
 
 	if (mode == MODE_RECORD || mode == MODE_PLAY_RECORD) {
 		if (modnum == m1->modnum) finalize_wav(m1->rx);
