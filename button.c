@@ -36,27 +36,6 @@ void btn_gpio_init(void)
 
 }
 
-int monitor_button(int num)
-{
-	char path[50];
-	static char previous_value = 49;
-	char value;
-
-	lseek(button_fd, 0, SEEK_SET);
-
-	if (read(button_fd, &value, 1) < 0) {
-		printf("Can't read button file\n");
-		return -1;
-	}
-
-	if (previous_value == 48 && value == 49)
-		printf("Button pressed\n");
-
-	previous_value = value;
-
-	return (int)value - 48;
-}
-
 #if 0
 int main(void) 
 {

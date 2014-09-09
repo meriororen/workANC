@@ -6,7 +6,7 @@
 #define NB TAP		// desired tapsize
 #define NG NB		// invert tapsize
 #define M_D NG/2  // emulate delay (as many as half the tap #)
-//#define M_D 4 // emulate delay (as many as half the tap #)
+//#define M_D 2 // emulate delay (as many as half the tap #)
 
 void Gauss_invert(double a[NG][NG], double b[NG][NG], int n);
 

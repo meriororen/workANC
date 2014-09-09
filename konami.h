@@ -19,7 +19,7 @@
 
 #define PAGE_SIZE 0x1000
 
-#define KHZ			44100
+#define KHZ			88200
 #define CHANNELS  2
 #define WORDSIZE  4
 
@@ -34,8 +34,8 @@
 #define CODEC2_I2S_BASE 0xFF250000
 
 // to keep it balanced, it must be (CHNNL * even number * wordsize) ~ 0.01 second
-#define BUFSIZE CHANNELS * 55 * WORDSIZE 
-#define BUFCOUNT 4
+#define BUFSIZE CHANNELS * 110 * WORDSIZE 
+#define BUFCOUNT 1
 
 /* ioctl definition */
 #define KONAMI_MAGIC 0xBA
@@ -50,10 +50,10 @@
 /* Sine generator */
 #define PI (3.14159)
 #define SAMPLE_BIT 24
-#define AMPLITUDE (pow(2, SAMPLE_BIT- 1))
+#define AMPLITUDE (pow(2, SAMPLE_BIT- 2))
 
 /* FIR Coefficient */
-#define COEF_COUNT 112
+#define COEF_COUNT 128
 #define I2S_BASE 0xFF240000
 
 /* Sign extend */
@@ -76,6 +76,7 @@ struct module {
 	int modnum;
 	unsigned long *coefbuf;
 	unsigned long *i2sconfig;
+	int i2c_fd;
 	struct runtime *rx;
 	struct runtime *tx;
 	struct module *m;
@@ -130,8 +131,9 @@ extern int button_fd;
 #define FIX_IMPULSE 2
 
 int calc_filter_lsq(double *impulse, double *result);
-int monitor_button(int num);
+int monitor_button(int num, struct module *m1, struct module *m2);
 void btn_gpio_init(void);
+int adjust_mic_vol(int fd, int modnum, int ldvol);
 
 static inline double fix2fl(int s) 
 {
@@ -146,8 +148,8 @@ static inline int fl2fix(double s)
 
 static inline int fl2fix24(double s)
 {
-	//return (int) ceil(s * (0x00000000007ffffF + 0.5));
-	return (int) ceil(s * ((double ) pow(2, 23) + 0.5));
+	//return (int) ceil(s * (0x0000000001fffffF + 0.5));
+	return (int) ceil(s * ((double) pow(2, 23) + 0.5));
 }
 
 static FILE * open_file(const char *filename, const char *mode) 
@@ -172,7 +174,7 @@ static size_t init_wav(FILE *file, int stereo)
 		0x66, 0x6D, 0x74, 0x20, /* "fmt " */
 		0x10, 0x00, 0x00, 0x00, /* size of fmt chunk (16) */
 		0x01, 0x00, 0x02, 0x00, /* PCM; 2-channels */
-		0x44, 0xAC, 0x00, 0x00, /* 44100 Hz */	
+		0x88, 0x58, 0x01, 0x00, /* 44100 Hz */	
 		0x98, 0x09, 0x04, 0x00, /* Byte Rate */
 		0x06, 0x00, 0x18, 0x00, /* 6 Bytes Align, 24 bits per sample */
 		0x64, 0x61, 0x74, 0x61, /* "data" */
