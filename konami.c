@@ -35,6 +35,7 @@ static int unstarted = 0;
 static FILE *reff;
 static FILE *resf;
 static FILE *resf2;
+static unsigned extradelay = 0;
 pthread_mutex_t start_mutex = PTHREAD_MUTEX_INITIALIZER;
 extern char *optarg;
 
@@ -59,7 +60,7 @@ void fix_data_generate(int type)
 }
 
 static
-int configure_i2s(struct module *m, int rx, int tx)
+int configure_i2s(struct module *m, int rx, int tx, unsigned delay, int mix)
 {
 #define CODEC_RX_SHORT	0x10
 #define CODEC_TX_SHORT 0x20
@@ -87,17 +88,8 @@ int configure_i2s(struct module *m, int rx, int tx)
 		return -1;
 	}
 	
-	if (rx == 1 && tx == 0) {
-		val = CODEC_RX_SHORT;
-	} else if (rx == 1 && tx == 1) {
-		val = CODEC_RX_SHORT | CODEC_TX_SHORT;
-	} else if (rx == 0 && tx == 1) {
-		val = CODEC_TX_SHORT;
-	} else {
-		val = 0; /* default == all mem */
-	}
+	val = ((delay & 0xFF) << 6)| (tx << 5) | (tx << 4) | (mix << 3) | 1;
 
-	val |= 0x01; /* enable */
 	m->i2sconfig[4] = val;
 
 	close(fd);
@@ -110,7 +102,7 @@ void init_mode(struct module *m)
 	struct runtime *rx = m->rx;
 	struct runtime *tx = m->tx;
 	
-	configure_i2s(m, 0, 0);
+	configure_i2s(m, 0, 0, 0, 0);
 	
 	switch (mode) {
 		case MODE_PLAY:
@@ -136,17 +128,22 @@ void init_mode(struct module *m)
 			if (anc_stat == ANC_CALIBRATE_DELAY) {
 				if (m->modnum == 2) {
 					tx->enable = 1; 
-					configure_i2s(m, 1, 0); /* rx short, tx mem */
+					configure_i2s(m, 1, 0, 0, 0); /* rx short, tx mem */
 				} 
 				if (m->modnum == 1) {	 /* codec1 */
 					rx->enable = 1;
-					configure_i2s(m, 0, 1); /* rx mem, tx short */
+					configure_i2s(m, 0, 1, 0, 0); /* rx mem, tx short */
 				}
 			} else if (anc_stat == ANC_CANCELLATION) {
 				printf("Not implemented (yet)\n");
 			}
 		default:
 			break;
+	}
+
+	if (mode != MODE_EQUAL_FILTER && mode != MODE_RECORD) {
+		if (m->modnum == 2) configure_i2s(m, 1, 0, 0, 0);
+		if (m->modnum == 1) configure_i2s(m, 0, 1, extradelay, 0); /* rx mem, tx short */
 	}
 }
 
@@ -314,12 +311,28 @@ int lms_calibrate_delay(double *res, int max) {
 	int j;
 
 	for (j = 0; j < max; j++) {
-		if (res[j] > 0.5) break;
+		if (res[j] > 0.1) break;
 	}
 
 	printf("LMS delay: %d\n", j - 2);
 
 	return j -= 2; // a little calibration
+}
+
+static 
+int anc_calibrate_delay(void) {
+	int i;
+	int m1d = 0, m2d = 0;
+
+	for (i = 0; i < CALIBUFSIZE; i++) {
+		double r = fix2fl(calibuf2[i]);
+		if (r > 0.10 && m2d == 0) m2d = i;
+		if (r < -0.30) { m1d = i; break; }
+	}
+
+	printf("extra delay: %d\n", 100 - (2 * abs(m2d - m1d)));
+
+	return 100 - (2 * (m2d - m1d));
 }
 
 static 
@@ -401,6 +414,7 @@ void receive_period(struct module *m)
 				if ((!waitfordelay && left) && target->xcount < target->max)
 					target->x[target->xcount++] = fix2fl(sext(x));
 				break;
+			case MODE_RECORD:
 			case MODE_PLAY_RECORD:
 			case MODE_PLAY_FIX_RECORD:
 				if (do_calibration) {
@@ -431,17 +445,15 @@ void receive_period(struct module *m)
 			case MODE_ANC:
 				switch (anc_stat) {
 					case ANC_CALIBRATE_DELAY:
-						if (calibc1 < CALIBUFSIZE && m->modnum == 2)
-							if (left) calibuf1[calibc1++] = sext(x);
-						if (calibc2 < CALIBUFSIZE && m->modnum == 1)
+						if (calibc2 < CALIBUFSIZE && m->modnum == 1) {
 							if (left) calibuf2[calibc2++] = sext(x);
-	
-						if (calibc1 >= CALIBUFSIZE && calibc2 >= CALIBUFSIZE &&
-							 m->modnum == 2) {
-							delaysize = calibrate_delay2();
+						} else {
+							extradelay = anc_calibrate_delay();
 							stop_all_threads = 1;
 							return;
 						}
+
+						rx->filesize += fwrite(buf, 1, sizeof(buf), rx->wav_file);
 						break;
 					default:
 						break;
@@ -586,16 +598,21 @@ void *record_loop(void *module)
 						fwrite(&target->x[j], sizeof(double), 1, resf);
 					}
 
+					printf("LMS Learning..\n");
+
 					lms_learn(target);
 
 					target->x = temp;
 
 					lms_complete(target);
+
 					printf("Learn Complete\n");
 					stop_all_threads = 1;
 				}
 				break;
 			case MODE_ANC:
+				if (anc_stat == ANC_CALIBRATE_DELAY)
+				
 				if (anc_stat == ANC_CANCELLATION) {
 					m->m->tx->current = rx->current;
 					m->m->tx->enable = 1;
@@ -607,17 +624,18 @@ void *record_loop(void *module)
 					if (target->xcount >= target->max) {
 						int j, del;
 						double *temp; 
-						
-						del = lms_calibrate_delay(target->x, target->max);
-						target->max -= del;
-						temp = target->x;
-						target->x = &target->x[del];
 
 						for (j = 0; j < target->max; j++) {
 							fwrite(&target->v[j], sizeof(double), 1, reff);
 							fwrite(&target->x[j], sizeof(double), 1, resf);
 						}
+
+						del = lms_calibrate_delay(target->x, target->max);
+						target->max -= del;
+						temp = target->x;
+						target->x = &target->x[del];
 							
+						printf("LMS Learning..\n");
 						lms_learn(target);
 
 						target->x = temp;
@@ -737,16 +755,16 @@ int main(int argc, char **argv)
 	pthread_t record_thread[2];
 	char playback_filename[32] = "";
 	char record_filename[32] = "recorded.wav";
+	char reference_data[16] = "ref"; 
 	char response_data[16] = "res";
 	char response_data2[16] = "res2";
-	char reference_data[16] = "ref"; 
 	char btn_path[50];
 	int nofilter = 0;
 	struct sigaction sa;
 
 	int option_index;
 	int c;
-	static const char short_options[] = "er::p:c:n:f:vd:m:NCaq";
+	static const char short_options[] = "er::p:c:n:f:vd:m:NCa:qx:";
 	static const struct option long_options[] = {
 		{"real", 0, 0, 'e'},
 		{"record", 2, 0, 'r'},
@@ -759,8 +777,9 @@ int main(int argc, char **argv)
 		{"module", 1, 0, 'm'},
 		{"nofilter", 0, 0, 'N'},
 		{"calibration", 0, 0, 'C'},
-		{"anc", 0, 0, 'a'},
+		{"anc", 1, 0, 'a'},
 		{"equal", 0, 0, 'q'},
+		{"delaym", 1, 0, 'x'},
 		{0, 0, 0, 0},
 	};
 
@@ -802,8 +821,9 @@ int main(int argc, char **argv)
 				break;
 			case 'a':
 				mode = MODE_ANC;
-				strcpy(playback_filename, "imp.wav");
+				strcpy(playback_filename, optarg);
 				anc_stat = ANC_CALIBRATE_DELAY;
+				extradelay = 100;
 				//anc_stat = ANC_CANCELLATION;
 				break;
 			case 'q':
@@ -840,6 +860,10 @@ int main(int argc, char **argv)
 				break;
 			case 'N':
 				nofilter = 1;
+				break;
+			case 'x':
+				if (extradelay == 0) 
+					extradelay = atoi(optarg);
 				break;
 			case 'f':
 				if (!strcmp(optarg, "imp")) {
@@ -905,32 +929,33 @@ int main(int argc, char **argv)
 
 	if (mode == MODE_NONE) goto finish;
 
-
 	/* Flush the last remaining RX & TX buffer */
 	record_next_period(m1->rx);
 	record_next_period(m2->rx);
 	play_next_period(m1->tx, 0);
 	play_next_period(m2->tx, 0);
 
-
 	/* Button initialization */
-
 	sprintf(btn_path, "%s/gpio%d/value", GPIO_PATH, BUTTON0);
 	if (access(btn_path, F_OK) < 0) btn_gpio_init();
 
 	sprintf(btn_path, "%s/gpio%d/value", GPIO_PATH, BUTTON0);
+
 	button_fd = open(btn_path, O_RDONLY);
 	if (button_fd < 0) { 
 		printf("Cannot open BUTTON0\n"); 
 		exit(EXIT_FAILURE);
 	}
 
+	/* I2C Config */
+	int i2c_fd = open("/dev/i2c-0", O_RDWR);
+	if (i2c_fd < 0) { fprintf(stderr, "Can't open i2c\n"); exit(1); }
+
+	//adjust_mic_vol(i2c_fd, 1, 0x29);
+	//if (mode != MODE_ANC) adjust_mic_vol(i2c_fd, 2, 0x27);
+
 	/* Main Loop */
 	int exit_loop = 0; 
-	if (m1->tx->enable) printf("Module 1 TX\n");
-	if (m1->rx->enable) printf("Module 1 RX\n");
-	if (m2->tx->enable) printf("Module 2 TX\n");
-	if (m2->rx->enable) printf("Module 2 RX\n");
 	while (1) {
 		if (init_files(m1, playback_filename, record_filename) < 0) break;
 		if (init_files(m2, playback_filename, record_filename) < 0) break;
@@ -974,6 +999,7 @@ int main(int argc, char **argv)
 					m1->tx->enable = 0;
 					m1->rx->enable = 0;
 					anc_stat = ANC_CANCELLATION;
+					if (modnum == m1->modnum) finalize_wav(m1->rx);
 					exit_loop = 1;
 					break;
 				case ANC_CANCELLATION:
