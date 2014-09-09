@@ -30,12 +30,14 @@ static int calibc2 = 0;
 static int calibuf0[CALIBUFSIZE];
 static int calibuf1[CALIBUFSIZE];
 static int calibuf2[CALIBUFSIZE];
+static int nofilter = 0;
 static lms_t *target;
 static int unstarted = 0;
 static FILE *reff;
 static FILE *resf;
 static FILE *resf2;
 static unsigned extradelay = 0;
+static int noanc = 0;
 pthread_mutex_t start_mutex = PTHREAD_MUTEX_INITIALIZER;
 extern char *optarg;
 
@@ -710,6 +712,48 @@ _exit:
 	pthread_exit(NULL);
 }
 
+static
+int set_filter_coef(struct module *m)
+{
+	int i;
+
+	for(i = 0; i < COEF_COUNT; i++) {
+		if (nofilter) {
+			m->coefbuf[i] = (i == 0) ? (0x800000) : 0;
+		} else {
+			m->coefbuf[i] = filter_taps[i];
+		}
+	}
+}
+
+int monitor_button(int num, struct module *m1, struct module *m2)
+{
+	static char previous_value = 49;
+	char value;
+
+	lseek(button_fd, 0, SEEK_SET);
+
+	if (read(button_fd, &value, 1) < 0) {
+		printf("Can't read button file\n");
+		return -1;
+	}
+
+	if (previous_value == 48 && value == 49) {
+		//nofilter = nofilter ? 0 : 1;
+		//set_filter_coef(m2);
+		noanc = noanc ? 0 : 1;
+		if (noanc) {
+			configure_i2s(m1, 0, 0, 0, 0);
+		} else {
+			configure_i2s(m1, 0, 1, extradelay, 0); /* rx mem, tx short */
+		}
+	}
+
+	previous_value = value;
+
+	return 0;
+}
+
 static 
 int init_files(struct module *m, const char *playback_filename, const char *record_filename)
 {
@@ -759,7 +803,6 @@ int main(int argc, char **argv)
 	char response_data[16] = "res";
 	char response_data2[16] = "res2";
 	char btn_path[50];
-	int nofilter = 0;
 	struct sigaction sa;
 
 	int option_index;
@@ -880,6 +923,19 @@ int main(int argc, char **argv)
 		}
 	}
 
+
+	/* Allocate buffers */
+	if(map_buffers(m1) < 0) return -1;
+	if(map_buffers(m2) < 0) return -1;
+
+	/* Map coefficient buffer */
+	//if (map_coef_buffer(m1) < 0) return -1;
+	if (map_coef_buffer(m2) < 0) return -1;
+
+	/* Open devices */
+	if(init_devices(m1) < 0) return -1;
+	if(init_devices(m2) < 0) return -1;
+
 	/* Open coefficient file */
 	if((coeff = open_file("coef.txt", "r")) == NULL) return -1;
 
@@ -891,31 +947,7 @@ int main(int argc, char **argv)
 		i++;
 	}
 
-	if (nofilter) {
-		//printf("No Filter Mode\n");
-		for(j = 0; j < COEF_COUNT; j++) {
-			filter_taps[j] = (j == 1) ? (0x800000) : 0;
-		} 
-	}
-
-	/* Allocate buffers */
-	if(map_buffers(m1) < 0) return -1;
-	if(map_buffers(m2) < 0) return -1;
-
-	/* Map coefficient buffer */
-	if (map_coef_buffer(m1) < 0) return -1;
-	if (map_coef_buffer(m2) < 0) return -1;
-
-	/* Open devices */
-	if(init_devices(m1) < 0) return -1;
-	if(init_devices(m2) < 0) return -1;
-
-	//printf("Setting Coefficients..\n");
-	for (i = 0; i < COEF_COUNT; i++) {
-		m1->coefbuf[i] = filter_taps[i];
-		m2->coefbuf[i] = filter_taps[i];
-		//printf("%d\n", m2->coefbuf[i]);
-	}
+	set_filter_coef(m2);
 
 	/* Begin */
 	init_mode(m1);
@@ -951,11 +983,11 @@ int main(int argc, char **argv)
 	int i2c_fd = open("/dev/i2c-0", O_RDWR);
 	if (i2c_fd < 0) { fprintf(stderr, "Can't open i2c\n"); exit(1); }
 
-	//adjust_mic_vol(i2c_fd, 1, 0x29);
-	//if (mode != MODE_ANC) adjust_mic_vol(i2c_fd, 2, 0x27);
+	if (mode == MODE_EQUAL_FILTER) adjust_mic_vol(i2c_fd, 1, 0x25);
 
 	/* Main Loop */
 	int exit_loop = 0; 
+	int u;
 	while (1) {
 		if (init_files(m1, playback_filename, record_filename) < 0) break;
 		if (init_files(m2, playback_filename, record_filename) < 0) break;
@@ -981,7 +1013,7 @@ int main(int argc, char **argv)
 			if (stop_all_threads == 1) break;
 			if (signal_received == SIGINT) 
 				stop_all_threads = 1;
-			monitor_button(BUTTON0);
+			monitor_button(BUTTON0, m1, m2);
 		}
 
 		join_thread(record_thread[0], rx, m1);
